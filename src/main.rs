@@ -15,11 +15,14 @@ macro_rules! node_init {
 */
 
 macro_rules! node_init2 {
-    ($i:ident, $f:ident) => { $i.$f.payload = &mut $i }
+    ($i:expr, $f:ident) => { $i.$f.payload = &mut $i }
 }
 
 impl<T> Node<T> {
 
+    //
+    // Since this constructor should also work for static data it must be 'const'.
+    //
     const fn new() -> Node<T> {
         Node {
             prev: ptr::null_mut(),
@@ -28,6 +31,10 @@ impl<T> Node<T> {
         }
     }
 
+    //
+    // List (not node!) initialization.
+    // Initially both pointers point to itself.
+    //
     fn init(&mut self) -> () {
         self.prev = self;
         self.next = self;
@@ -42,10 +49,16 @@ impl<T> Node<T> {
     }
 */
 
+    //
+    // List is not empty when both poiters don't point to itself.
+    //
     fn is_not_empty(&self) -> bool {
         self.next as *const Node<T> != self
     }
 
+    //
+    // Peeks list's head item or returns None.
+    //
     unsafe fn head(&self) -> Option<&mut T> {
         if self.is_not_empty() { 
             Some(&mut (*((*self.next).payload))) 
@@ -54,6 +67,9 @@ impl<T> Node<T> {
         }
     }
 
+    //
+    // Peeks list's tail or returns None.
+    //
     unsafe fn tail(&self) -> Option<&mut T> {
         if self.is_not_empty() { 
             Some(&mut (*((*self.prev).payload)))
@@ -62,7 +78,14 @@ impl<T> Node<T> {
         }
     }
 
+    //
+    // Inserts specified node at the head of the list.
+    //
     fn insert_head(&mut self, node: &mut Node<T>) -> () {
+        
+        assert!(node.prev == ptr::null_mut());
+        assert!(node.next == ptr::null_mut());
+
         node.next = self.next;
         node.prev = self;
 
@@ -73,10 +96,16 @@ impl<T> Node<T> {
         self.next = node;
     }
 
+    //
+    // Appends the node to the tail.
+    //
     unsafe fn append(&mut self, node: &mut Node<T>) -> () {
         (*self.prev).insert_head(node);
     }
 
+    //
+    // Removes the specified node from the list. Note that 
+    //
     fn remove(node: &mut Node<T>) -> () {
         unsafe {
             (*node.prev).next = node.next;
@@ -87,11 +116,15 @@ impl<T> Node<T> {
         node.prev = ptr::null_mut();
     }
 
-    unsafe fn filter<F>(&mut self, f: F) -> () where F: Fn(&T) -> bool {
+    //
+    // Removes nodes for which the closure returns true.
+    // The function may lso be used for list traversal when the closure always returns false.
+    //
+    unsafe fn filter<F>(&mut self, closure: F) -> () where F: Fn(&T) -> bool {
         let mut item = self.next;
 
         while item != self {
-            let del = f(&(*(*item).payload));
+            let del = closure(&(*(*item).payload));
             item = (*item).next;
             
             if del {
@@ -100,11 +133,15 @@ impl<T> Node<T> {
         } 
     }
 
-    unsafe fn insert<F>(&mut self, node: &mut Node<T>, f: F) -> () where F: Fn(&T) -> Option<bool> {
+    //
+    // Inserts the specified node before of after the one for which the closure returned Some(x).
+    //
+    unsafe fn insert<F>(&mut self, node: &mut Node<T>, closure: F) -> () 
+        where F: Fn(&T) -> Option<bool> {
         let mut item = self.next;
 
         while item != self {
-            if let Some(before) = f(&(*(*item).payload)) {
+            if let Some(before) = closure(&(*(*item).payload)) {
             let target = if before { &mut *((*item).prev) } else { &mut *item };
                 target.insert_head(node);
                 break;
@@ -123,22 +160,26 @@ struct Item {
 fn main() {
     let mut test_list: List<Item> = List::new();
 
-    let mut item1: Item = Item { foo: 1, linkage: Node::new() };
-    let mut item2: Item = Item { foo: 2, linkage: Node::new() };
-    let mut item3: Item = Item { foo: 3, linkage: Node::new() };
-
+    let mut item =  [ 
+        Item { foo: 1, linkage: Node::new() },
+        Item { foo: 2, linkage: Node::new() },
+        Item { foo: 3, linkage: Node::new() },
+        Item { foo: 4, linkage: Node::new() },
+        Item { foo: 5, linkage: Node::new() }
+    ];
 
     unsafe {
 
         test_list.init();
 
-        node_init2!(item1, linkage);
-        node_init2!(item2, linkage);
-        node_init2!(item3, linkage);
+        for i in 0..5 {
+            node_init2!(item[i], linkage);
 
-        test_list.append(&mut item1.linkage);
-        test_list.append(&mut item2.linkage);
+        }
 
+        for i in 0..4 {
+            test_list.append(&mut item[i].linkage);
+        }
 
         test_list.filter(|item| {
             println!("before {}", item.foo);
@@ -146,7 +187,7 @@ fn main() {
         });
 
 
-        test_list.insert(&mut item3.linkage, |item| {
+        test_list.insert(&mut item[4].linkage, |item| {
             if item.foo == 2 { Some(false) } else { None }
         });
 
