@@ -1,5 +1,16 @@
-use std::ptr;
+//
+// This is the attempt to implement C-style intrusive lists in Rust.
+// Note that this code is mostly unsafe!
+//
 
+use std::ptr;
+use std::cell::Cell;
+
+//
+// Embeddable object contains two pointers to prev/next list intems and also
+// payload pointer which points to the object containing this list node. This
+// pointer is introduced to avoid pointer arithmetic.
+//
 struct Node<T> {
     prev: *mut Node<T>,
     next: *mut Node<T>,
@@ -8,20 +19,19 @@ struct Node<T> {
 
 type List<T> = Node<T>;
 
-/*
 macro_rules! node_init {
-    ($i:ident, $f:ident) => { $i.$f.node_init(&mut $i) }
-}
-*/
-
-macro_rules! node_init2 {
-    ($i:expr, $f:ident) => { $i.$f.payload = &mut $i }
+    ($i:expr, $f:ident) => 
+    { 
+        $i.$f.payload = &mut $i;
+        $i.$f.prev = ptr::null_mut();
+        $i.$f.next = ptr::null_mut();
+    }
 }
 
 impl<T> Node<T> {
 
     //
-    // Since this constructor should also work for static data it must be 'const'.
+    // The constructor should also work for static data.
     //
     const fn new() -> Node<T> {
         Node {
@@ -32,22 +42,13 @@ impl<T> Node<T> {
     }
 
     //
-    // List (not node!) initialization.
-    // Initially both pointers point to itself.
+    // List (not node!) initialization. Initially both pointers point to itself.
     //
     fn init(&mut self) -> () {
         self.prev = self;
         self.next = self;
         self.payload = ptr::null_mut();
     }
-
-/*
-    fn node_init(&mut self, obj: &mut T) -> () {
-        self.prev = ptr::null_mut();
-        self.next = ptr::null_mut();
-        self.payload = obj;
-    }
-*/
 
     //
     // List is not empty when both poiters don't point to itself.
@@ -57,29 +58,29 @@ impl<T> Node<T> {
     }
 
     //
-    // Peeks list's head item or returns None.
+    // Returns reference to object corresponding to list head.
     //
     unsafe fn head(&self) -> Option<&mut T> {
         if self.is_not_empty() { 
-            Some(&mut (*((*self.next).payload))) 
+            Some(&mut *((*self.next).payload))
         } else { 
             None 
         }
     }
 
     //
-    // Peeks list's tail or returns None.
+    // Returns reference to object corresponding to list tail.
     //
     unsafe fn tail(&self) -> Option<&mut T> {
         if self.is_not_empty() { 
-            Some(&mut (*((*self.prev).payload)))
+            Some(&mut *((*self.prev).payload))
         } else {
             None
         }
     }
 
     //
-    // Inserts specified node at the head of the list.
+    // Inserts the specified node in the head of the list.
     //
     fn insert_head(&mut self, node: &mut Node<T>) -> () {
         
@@ -104,9 +105,14 @@ impl<T> Node<T> {
     }
 
     //
-    // Removes the specified node from the list. Note that 
+    // Removes the specified node from the list. Note that the list is not 
+    // specified, it extracts node from any list.
     //
     fn remove(node: &mut Node<T>) -> () {
+
+        assert!(node.prev != ptr::null_mut());
+        assert!(node.next != ptr::null_mut());
+
         unsafe {
             (*node.prev).next = node.next;
             (*node.next).prev = node.prev;
@@ -118,11 +124,12 @@ impl<T> Node<T> {
 
     //
     // Removes nodes for which the closure returns true.
-    // The function may lso be used for list traversal when the closure always returns false.
+    // The function may also be used to traverse the list when the closure  
+    // always returns false (each node will be visited and the list will remain
+    // unchanged).
     //
     unsafe fn filter<F>(&mut self, closure: F) -> () where F: Fn(&T) -> bool {
         let mut item = self.next;
-
         while item != self {
             let del = closure(&(*(*item).payload));
             item = (*item).next;
@@ -134,15 +141,20 @@ impl<T> Node<T> {
     }
 
     //
-    // Inserts the specified node before of after the one for which the closure returned Some(x).
+    // Inserts the specified node before or after the one for which the closure 
+    // returned Some(x).
     //
     unsafe fn insert<F>(&mut self, node: &mut Node<T>, closure: F) -> () 
         where F: Fn(&T) -> Option<bool> {
-        let mut item = self.next;
 
+        let mut item = self.next;
         while item != self {
             if let Some(before) = closure(&(*(*item).payload)) {
-            let target = if before { &mut *((*item).prev) } else { &mut *item };
+                let target = if before { 
+                    &mut *((*item).prev) 
+                } else { 
+                    &mut *item 
+                };
                 target.insert_head(node);
                 break;
             }
@@ -152,12 +164,14 @@ impl<T> Node<T> {
     }
 }
 
-struct Item {
-    foo: usize,
-    linkage: Node<Item>
-}
 
 fn main() {
+
+    struct Item {
+        foo: usize,
+        linkage: Node<Item>
+    }
+
     let mut test_list: List<Item> = List::new();
 
     let mut item =  [ 
@@ -168,31 +182,69 @@ fn main() {
         Item { foo: 5, linkage: Node::new() }
     ];
 
+    let mut test =  [ 
+        Item { foo: 6, linkage: Node::new() },
+        Item { foo: 7, linkage: Node::new() },
+    ];
+
     unsafe {
 
         test_list.init();
 
-        for i in 0..5 {
-            node_init2!(item[i], linkage);
+        assert!(test_list.is_not_empty() == false);
 
-        }
-
-        for i in 0..4 {
+        //
+        // Insert items 1..5.
+        //
+        for i in 0..item.len() {
+            node_init!(item[i], linkage);
             test_list.append(&mut item[i].linkage);
         }
 
-        test_list.filter(|item| {
-            println!("before {}", item.foo);
+        assert!(test_list.is_not_empty() == true);
+
+        //
+        // Init two extra items 6 and 7.
+        //
+        for i in 0..test.len() {
+            node_init!(test[i], linkage);
+        }
+
+        let num = Cell::new(0);        
+
+        //
+        // Count items.
+        //
+        test_list.filter(|_item| {
+            num.set(num.get() + 1);
             false
         });
 
+        assert!(num.get() == item.len());
+        assert!(test_list.head().unwrap().foo == 1);
+        assert!(test_list.tail().unwrap().foo == 5);
 
-        test_list.insert(&mut item[4].linkage, |item| {
-            if item.foo == 2 { Some(false) } else { None }
+        //
+        // Insert hew head (before 1).
+        //
+        test_list.insert(&mut test[0].linkage, |item| {
+            if item.foo == 1 { Some(true) } else { None }
         });
 
+        let tail_val = test_list.tail().unwrap().foo;
+
+        //
+        // Insert new tail.
+        //
+        test_list.insert(&mut test[1].linkage, |item| {
+            if item.foo == tail_val { Some(false) } else { None }
+        });
+
+        assert!(test_list.head().unwrap().foo == 6);
+        assert!(test_list.tail().unwrap().foo == 7);
+
         test_list.filter(|item| {
-            println!("after {}", item.foo);
+            println!("item {}", item.foo);
             false
         });
 
