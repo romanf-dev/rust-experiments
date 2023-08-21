@@ -4,10 +4,7 @@ Rust experiments
 linked_list
 -----------
 
-Attempt to implement C-style intrusive doubly-linked list using raw pointers.
-Node object is intended to be embedded into some other (embracing) object.
-Unlike C, prev/next pointers may be completely hidden by using closures.
-Also, this implementation has no special cases like 'empty list', so both insertion and deletion procedures don't use 'if's, simple and clean.
+Yet another attempt to implement C-style intrusive doubly-linked list using raw pointers. It relies on aliasing, so perhaps it is not so good idea to do it in Rust.
 
 mcu_bare_metal
 --------------
