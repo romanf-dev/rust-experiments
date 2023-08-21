@@ -14,10 +14,10 @@ impl<T> Node<T> {
     }
     
     fn set_next(&mut self, new_next: *mut Node<T>) {
-		if let Some((prev, _)) = self.links {
-			self.links = Some((prev, new_next));
-		}
-	}
+        if let Some((prev, _)) = self.links {
+	        self.links = Some((prev, new_next));
+        }
+    }
 	
     fn set_prev(&mut self, new_prev: *mut Node<T>) {
 		if let Some((_, next)) = self.links {
