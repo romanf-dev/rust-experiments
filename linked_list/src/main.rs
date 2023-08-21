@@ -33,6 +33,7 @@ impl<T> Node<T> {
 
 impl<T> Drop for Node<T> {
     fn drop(&mut self) {
+		println!("node drop");
         assert!(self.links.is_none());
     }
 }
@@ -99,7 +100,9 @@ impl<'a, T: Linkable> List<'a, T> {
 
 impl<'a, T: Linkable> Drop for List<'a, T> {
     fn drop(&mut self) {
+		println!("list drop");
         assert!(self.get_head().is_none());
+        self.root.links = None;
     }
 }
 
@@ -114,20 +117,24 @@ impl Linkable for Item {
     }
 }
 
-static mut LIST : List<Item> = List::<Item>::new();
-static mut ONE : Item = Item { foo: 1, linkage: Node::new() };
-static mut TWO : Item = Item { foo: 2, linkage: Node::new() };
-static mut THREE : Item = Item { foo: 3, linkage: Node::new() };
+static mut LIST: Option<List<Item>> = Some(List::<Item>::new());
+
+static mut ITEMS: Option<[Item; 3]> = Some([
+	Item { foo: 1, linkage: Node::new() },
+	Item { foo: 2, linkage: Node::new() },
+	Item { foo: 3, linkage: Node::new() },
+]);
 
 fn main() {
-	unsafe {	
-		LIST.init();
-		LIST.push(&mut ONE);
-		LIST.push(&mut TWO);
-		LIST.push(&mut THREE);
-				
-		while let Some(val) = LIST.pop() {
-			println!("val = {}", val.foo);
-		}
+	let mut list = unsafe { LIST.take().unwrap() };
+	let mut items = unsafe { ITEMS.take().unwrap() };
+	
+	list.init();
+	list.push(&mut items[0]);
+	list.push(&mut items[1]);
+	list.push(&mut items[2]);
+			
+	while let Some(val) = list.pop() {
+		println!("val = {}", val.foo);
 	}
 }
