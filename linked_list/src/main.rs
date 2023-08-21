@@ -33,7 +33,6 @@ impl<T> Node<T> {
 
 impl<T> Drop for Node<T> {
     fn drop(&mut self) {
-        println!("node drop");
         assert!(self.links.is_none());
     }
 }
@@ -99,7 +98,6 @@ impl<'a, T: Linkable> List<'a, T> {
 
 impl<'a, T: Linkable> Drop for List<'a, T> {
     fn drop(&mut self) {
-        println!("list drop");
         assert!(self.get_head().is_none());
         self.root.links = None;
     }
