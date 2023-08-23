@@ -114,24 +114,23 @@ impl Linkable for Item {
     }
 }
 
-static mut LIST: Option<List<Item>> = Some(List::<Item>::new());
-
-static mut ITEMS: Option<[Item; 3]> = Some([
-	Item { foo: 1, linkage: Node::new() },
-	Item { foo: 2, linkage: Node::new() },
-	Item { foo: 3, linkage: Node::new() },
-]);
+static mut LIST: List<Item> = List::<Item>::new();
 
 fn main() {
-	let mut list = unsafe { LIST.take().unwrap() };
-	let mut items = unsafe { ITEMS.take().unwrap() };
-	
-	list.init();
-	list.push(&mut items[0]);
-	list.push(&mut items[1]);
-	list.push(&mut items[2]);
-			
-	while let Some(val) = list.pop() {
-		println!("val = {}", val.foo);
-	}
+    let mut items: [Item; 3] = [
+	    Item { foo: 1, linkage: Node::new() },
+	    Item { foo: 2, linkage: Node::new() },
+	    Item { foo: 3, linkage: Node::new() },
+    ];
+
+    unsafe {
+	    LIST.init();
+	    LIST.push(&mut items[0]);
+	    LIST.push(&mut items[1]);
+	    LIST.push(&mut items[2]);
+			    
+	    while let Some(val) = LIST.pop() {
+		    println!("val = {}", val.foo);
+	    }
+    }
 }
