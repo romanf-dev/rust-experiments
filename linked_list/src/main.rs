@@ -18,13 +18,13 @@ impl<T> Node<T> {
             self.links = Some((prev, new_next));
         }
     }
-	
+    
     fn set_prev(&mut self, new_prev: *mut Node<T>) {
         if let Some((_, next)) = self.links {
             self.links = Some((new_prev, next));
         }
     }
-	
+    
     fn to_obj(&mut self) -> &mut T {
         let ptr = self.payload.take().unwrap();
         unsafe { &mut *ptr }
@@ -68,7 +68,7 @@ impl<'a, T: Linkable> List<'a, T> {
                     None 
                 },
             _ => None
-        }		
+        }       
     }
     
     fn push<'b>(&mut self, object: &'b mut T) {
@@ -89,7 +89,7 @@ impl<'a, T: Linkable> List<'a, T> {
                 (*prev).set_next(next);
                 (*next).set_prev(prev);
             }
-			
+            
             return Some(node.to_obj());
         }
         None
@@ -118,19 +118,19 @@ static mut LIST: List<Item> = List::<Item>::new();
 
 fn main() {
     let mut items: [Item; 3] = [
-	    Item { foo: 1, linkage: Node::new() },
-	    Item { foo: 2, linkage: Node::new() },
-	    Item { foo: 3, linkage: Node::new() },
+        Item { foo: 1, linkage: Node::new() },
+        Item { foo: 2, linkage: Node::new() },
+        Item { foo: 3, linkage: Node::new() },
     ];
 
     unsafe {
-	    LIST.init();
-	    LIST.push(&mut items[0]);
-	    LIST.push(&mut items[1]);
-	    LIST.push(&mut items[2]);
-			    
-	    while let Some(val) = LIST.pop() {
-		    println!("val = {}", val.foo);
-	    }
+        LIST.init();
+        LIST.push(&mut items[0]);
+        LIST.push(&mut items[1]);
+        LIST.push(&mut items[2]);
+                
+        while let Some(val) = LIST.pop() {
+            println!("val = {}", val.foo);
+        }
     }
 }
