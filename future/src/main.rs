@@ -116,7 +116,6 @@ impl<'a, T: Linkable> Drop for List<'a, T> {
     }
 }
 
-
 //----------------------------------------------------------------------
 
 struct Queue<'a, T: Linkable> {
@@ -129,7 +128,7 @@ macro_rules! queue_init {
 }
 
 macro_rules! actor_init {
-    () => { Actor { foo: 10, mailbox: None, future: None, linkage: Node::new() } };
+    () => { Actor { prio: 10, mailbox: None, future: None, linkage: Node::new() } };
 }
 
 impl<'a, T: Linkable> Queue<'a, T> {
@@ -143,8 +142,15 @@ impl<'a, T: Linkable> Queue<'a, T> {
         self.msgs.pop()
     }
     
-    fn put(&mut self, n: &'a mut T) {
-        self.msgs.push(n);
+    fn put(&mut self, n: &'static mut T) {
+        if self.subscribers.is_empty() {
+            self.msgs.push(n);
+        } else {
+            let a = self.subscribers.pop().unwrap();
+            a.mailbox = Some(n);
+            println!("activation");
+            unsafe { SCHED[0].push(a); }
+        }
     }
     
     fn is_empty(&self) -> bool {
@@ -153,36 +159,38 @@ impl<'a, T: Linkable> Queue<'a, T> {
 }
 
 struct Actor {
-    foo: u32,
+    prio: u32,
     mailbox: Option<&'static mut dyn Any>,
     future: Option<Pin<&'static mut dyn Future<Output = ()>>>,
     linkage: Node<Self>
 }
 
-struct MyFut<'a, 'b, T: Linkable> {
+struct MsgFuture<'a, 'b, T: Linkable> {
     queue: &'a mut Queue<'b, T>,
-    actor: &'a mut Actor
+    actor: Option<&'a mut Actor>
 }
 
-impl<'a, 'b, T: Linkable> MyFut<'a, 'b, T> {
-    fn new(q: &'a mut Queue<'b, T>, a: &'a mut Actor) -> MyFut<'a, 'b, T> {
-        MyFut { queue: q, actor: a }
+impl<'a, 'b, T: Linkable> MsgFuture<'a, 'b, T> {
+    fn new(q: &'a mut Queue<'b, T>, a: &'a mut Actor) -> MsgFuture<'a, 'b, T> {
+        MsgFuture { queue: q, actor: Some(a) }
     }    
 }
 
-impl<'a, 'b: 'a, T: Linkable + 'static> Future for MyFut<'a, 'b, T> {
+impl<'a, 'b: 'a, T: Linkable + 'static> Future for MsgFuture<'a, 'b, T> {
     type Output = &'b mut T;
     
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
-        if self.actor.mailbox.is_some() {
-            let any_msg = self.actor.mailbox.take().unwrap();
+        let a = self.actor.take().unwrap();
+        if a.mailbox.is_some() {
+            let any_msg = a.mailbox.take().unwrap();
             let msg = any_msg.downcast_mut::<T>().unwrap();
             println!("from actor");
             return Poll::Ready(msg);
         } else {
             if self.queue.is_empty() {
                 println!("poll returns pending");
-                
+                self.queue.subscribers.push(a);
+                self.actor = Some(a);
                 return Poll::Pending;
             } else {
                 println!("poll returns ready");
@@ -193,8 +201,8 @@ impl<'a, 'b: 'a, T: Linkable + 'static> Future for MyFut<'a, 'b, T> {
 }
 
 impl Actor {
-    fn block_on<'a, 'b, T: Linkable>(&'a mut self, q: &'a mut Queue<'b, T>) -> MyFut<'a, 'b, T> {
-        MyFut::<T>::new(q, self)
+    fn block_on<'a, 'b, T: Linkable>(&'a mut self, q: &'a mut Queue<'b, T>) -> MsgFuture<'a, 'b, T> {
+        MsgFuture::<T>::new(q, self)
     }
 }
 
@@ -215,15 +223,15 @@ impl Linkable for Message {
     }
 }
 
-
 static mut MSG: Message = Message { n: 5, linkage: Node::new() };
 static mut QUEUE: Queue<Message> = queue_init!();
 static mut ACTOR: [Actor; 2] = [ actor_init!(), actor_init!() ];
+static mut SCHED: [List<Actor>; 2] = [ List::new(), List::new() ];
 
 async fn func(this: &mut Actor) -> () {
     let q = unsafe { &mut QUEUE };
     
-    let mut foo = this.foo;
+    let mut foo = this.prio;
     loop {
         println!("before await {}", foo);
         let t = this.block_on(q).await;
@@ -255,19 +263,20 @@ fn print_sizeof<F: Future>(_: &mut F) -> usize {
     core::mem::size_of::<F>()
 }
 
-fn call(vect: usize) {   
+fn call_once(a: &mut Actor) {   
     let waker = waker_ref();
     let mut cx = std::task::Context::from_waker(waker);    
-    
-    for i in 0..3 {
-        println!("i = {}", i);
-        
-        unsafe {
-            let mut p = ACTOR[vect].future.take().unwrap();    
-            let _ = p.as_mut().poll(&mut cx);
-            ACTOR[vect].future = Some(p);
-            QUEUE.put(&mut MSG);
-        }
+    let mut p = a.future.take().unwrap();    
+    let _ = p.as_mut().poll(&mut cx);
+    a.future = Some(p);
+}
+
+fn schedule(vect: usize) {
+    let s = unsafe { &mut SCHED[vect] };
+     
+    while s.is_empty() == false {
+        let a = s.pop().unwrap();
+        call_once(a);           
     }
 }
 
@@ -280,9 +289,17 @@ fn main() {
     let s = to_static(&mut f);
     
     unsafe { 
-        ACTOR[0].mailbox = Some(&mut MSG);
         ACTOR[0].future = Some(Pin::new_unchecked(s)); 
-    }
+        SCHED[0].init();
     
-    call(0);
+        call_once(&mut ACTOR[0]);
+        
+        QUEUE.put(&mut MSG);
+        
+        schedule(0);
+        
+        QUEUE.put(&mut MSG);
+        
+        schedule(0);        
+    }
 }
