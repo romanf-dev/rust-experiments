@@ -139,13 +139,14 @@ impl<'a, T: Linkable> Queue<'a, T> {
         self.subscribers.init();
         self.sched_context = Some(sched);
     }
-    
-    fn is_empty(&self) -> bool {
-        self.msgs.is_empty()
-    }
         
-    fn get(&mut self) -> Option<&'a mut T> {
-        self.msgs.pop()
+    fn get<'b>(&mut self, actor: &'b mut Actor) -> Option<&'a mut T> {
+        if self.msgs.is_empty() {
+            self.subscribers.push(actor);
+            None
+        } else {
+            self.msgs.pop()
+        }
     }
     
     fn put(&mut self, item: &'static mut T) {
@@ -189,7 +190,7 @@ impl Linkable for Actor {
 impl Actor {
     fn call(&mut self) {   
         let waker = waker_ref();
-        let mut cx = std::task::Context::from_waker(waker);
+        let mut cx = core::task::Context::from_waker(waker);
         
         if let Some(ref mut future) = self.future {
             let _ = future.as_mut().poll(&mut cx);
@@ -209,38 +210,27 @@ impl Actor {
     fn block_on<'refs, 'content, T: Linkable>
         (&'refs mut self, q: &'refs mut Queue<'content, T>) -> MsgFuture<'refs, 'content, T> {
 
-        MsgFuture::<T>::new(q, self)
+        MsgFuture::<T> { queue: Some(q), actor: self }
     }
 }
 
 struct MsgFuture<'a, 'q, T: Linkable> {
-    queue: &'a mut Queue<'q, T>,
-    actor: Option<&'a mut Actor>
-}
-
-impl<'a, 'q, T: Linkable> MsgFuture<'a, 'q, T> {
-    fn new(q: &'a mut Queue<'q, T>, a: &'a mut Actor) -> MsgFuture<'a, 'q, T> {
-        MsgFuture { queue: q, actor: Some(a) }
-    }    
+    queue: Option<&'a mut Queue<'q, T>>,
+    actor: &'a mut Actor
 }
 
 impl<'a, 'q, T: Linkable + 'static> Future for MsgFuture<'a, 'q, T> {
     type Output = &'q mut T;
     
     fn poll(mut self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
-        let actor = self.actor.take().unwrap();
-        if actor.mailbox.is_none() {
-            if self.queue.is_empty() {
-                self.queue.subscribers.push(actor);
-                self.actor = Some(actor);
-                Poll::Pending
-            } else {
-                Poll::Ready(self.queue.get().unwrap())
-            }            
+        if let Some(queue) = self.queue.take() {
+            match queue.get(self.actor) {
+                Some(msg) =>  Poll::Ready(msg),
+                None => Poll::Pending
+            }           
         } else {
-            let any_msg = actor.mailbox.take().unwrap();
-            let msg = any_msg.downcast_mut::<T>().unwrap();
-            Poll::Ready(msg)
+            let msg = self.actor.mailbox.take().unwrap();
+            Poll::Ready(msg.downcast_mut::<T>().unwrap())
         }
     }
 }
@@ -376,7 +366,7 @@ struct ExampleMsg2 {
     t: u32
 }
 
-async fn func(this: &mut Actor) -> () {
+async fn func(this: &mut Actor) {
     let q1 = unsafe { &mut QUEUE1 };
     let q2 = unsafe { &mut QUEUE2 };
     let mut sum = 0;
