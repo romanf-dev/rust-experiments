@@ -20,10 +20,10 @@ SECTIONS
 		_etext = .;
 	} > FLASH
     
-    .ARM.exidx :
+    /DISCARD/ :
     {
         *(.ARM.exidx*)
-    } > FLASH
+    }
 
 	.data : AT (_etext)
 	{
