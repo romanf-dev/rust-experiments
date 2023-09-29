@@ -32,6 +32,7 @@ impl<T> Node<T> {
     }
     
     fn to_obj<'a>(&mut self) -> &'a mut T {
+        assert!(self.links.is_none());
         let ptr = self.payload.take().unwrap();
         unsafe { &mut *ptr }
     } 
@@ -65,7 +66,7 @@ impl<'a, T: Linkable> List<'a, T> {
         self.root.links = Some((this, this));
     }
 
-    fn get_head(&self) -> Option<&mut Node<T>> {
+    fn peek_head_node(&self) -> Option<&mut Node<T>> {
         match self.root.links { 
             Some((_, next)) => 
                 if next as *const Node<T> != &self.root { 
@@ -78,7 +79,7 @@ impl<'a, T: Linkable> List<'a, T> {
     }
     
     fn is_empty(&self) -> bool {
-        self.get_head().is_none()
+        self.peek_head_node().is_none()
     }
     
     fn push<'b>(&mut self, object: &'b mut T) {
@@ -86,13 +87,13 @@ impl<'a, T: Linkable> List<'a, T> {
         let node = object.to_links();
         let (prev, next) = self.root.links.take().unwrap();
         node.links = Some((prev, &mut self.root));
+        node.payload = Some(ptr);
         self.root.links = Some((node, next));
         unsafe { (*prev).set_next(node); }
-        node.payload = Some(ptr);
     }
 
     fn pop<'b>(&mut self) -> Option<&'b mut T> {
-        if let Some(node) = self.get_head() {
+        if let Some(node) = self.peek_head_node() {
             let (prev, next) = node.links.take().unwrap();
 
             unsafe {
@@ -100,15 +101,16 @@ impl<'a, T: Linkable> List<'a, T> {
                 (*next).set_prev(prev);
             }
             
-            return Some(node.to_obj());
+            Some(node.to_obj())
+        } else {
+            None
         }
-        None
     }
 }
 
 impl<'a, T: Linkable> Drop for List<'a, T> {
     fn drop(&mut self) {
-        assert!(self.get_head().is_none());
+        assert!(self.peek_head_node().is_none());
         self.root.links = None;
     }
 }
@@ -138,25 +140,25 @@ impl<'a, T: Linkable> Queue<'a, T> {
         self.sched_context = Some(sched);
     }
     
+    fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
+        
     fn get(&mut self) -> Option<&'a mut T> {
         self.msgs.pop()
     }
     
-    fn put(&mut self, n: &'static mut T) {
+    fn put(&mut self, item: &'static mut T) {
         if self.subscribers.is_empty() {
-            self.msgs.push(n);
+            self.msgs.push(item);
         } else {
             let actor = self.subscribers.pop().unwrap();
-            actor.mailbox = Some(n);
-            println!("activation");
-            let sched = self.sched_context.take().unwrap();
-            sched.runq[actor.prio].push(actor);
-            self.sched_context = Some(sched);
+            actor.mailbox = Some(item);
+            
+            if let Some(ref mut sched) = self.sched_context {
+                sched.runq[actor.prio].push(actor)
+            }
         }
-    }
-    
-    fn is_empty(&self) -> bool {
-        self.msgs.is_empty()
     }
 }
 
@@ -178,12 +180,6 @@ macro_rules! actor_init {
     };
 }
 
-impl Actor {
-    fn block_on<'a, 'b, T: Linkable>(&'a mut self, q: &'a mut Queue<'b, T>) -> MsgFuture<'a, 'b, T> {
-        MsgFuture::<T>::new(q, self)
-    }
-}
-
 impl Linkable for Actor {
     fn to_links(&mut self) -> &mut Node<Self> {
         &mut self.linkage
@@ -193,14 +189,15 @@ impl Linkable for Actor {
 impl Actor {
     fn call(&mut self) {   
         let waker = waker_ref();
-        let mut cx = std::task::Context::from_waker(waker);    
-        let mut p = self.future.take().unwrap();    
-        let _ = p.as_mut().poll(&mut cx);
-        self.future = Some(p);
+        let mut cx = std::task::Context::from_waker(waker);
+        
+        if let Some(ref mut future) = self.future {
+            let _ = future.as_mut().poll(&mut cx);
+        }
     }    
 
     fn spawn(&mut self, f: &mut (impl Future<Output=()> + 'static)) {
-        fn to_static<'a, T>(v: &'a mut T) -> &'static mut T {
+        fn to_static<'x, T>(v: &'x mut T) -> &'static mut T {
             unsafe { mem::transmute(v) }
         }        
         
@@ -209,69 +206,80 @@ impl Actor {
         self.call();
     }
     
+    fn block_on<'refs, 'content, T: Linkable>
+        (&'refs mut self, q: &'refs mut Queue<'content, T>) -> MsgFuture<'refs, 'content, T> {
+
+        MsgFuture::<T>::new(q, self)
+    }
 }
 
-struct MsgFuture<'a, 'b, T: Linkable> {
-    queue: &'a mut Queue<'b, T>,
+struct MsgFuture<'a, 'q, T: Linkable> {
+    queue: &'a mut Queue<'q, T>,
     actor: Option<&'a mut Actor>
 }
 
-impl<'a, 'b, T: Linkable> MsgFuture<'a, 'b, T> {
-    fn new(q: &'a mut Queue<'b, T>, a: &'a mut Actor) -> MsgFuture<'a, 'b, T> {
+impl<'a, 'q, T: Linkable> MsgFuture<'a, 'q, T> {
+    fn new(q: &'a mut Queue<'q, T>, a: &'a mut Actor) -> MsgFuture<'a, 'q, T> {
         MsgFuture { queue: q, actor: Some(a) }
     }    
 }
 
-impl<'a, 'b: 'a, T: Linkable + 'static> Future for MsgFuture<'a, 'b, T> {
-    type Output = &'b mut T;
+impl<'a, 'q, T: Linkable + 'static> Future for MsgFuture<'a, 'q, T> {
+    type Output = &'q mut T;
     
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
-        let a = self.actor.take().unwrap();
-        if a.mailbox.is_some() {
-            let any_msg = a.mailbox.take().unwrap();
-            let msg = any_msg.downcast_mut::<T>().unwrap();
-            println!("from actor");
-            return Poll::Ready(msg);
-        } else {
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
+        let actor = self.actor.take().unwrap();
+        if actor.mailbox.is_none() {
             if self.queue.is_empty() {
-                println!("poll returns pending");
-                self.queue.subscribers.push(a);
-                self.actor = Some(a);
-                return Poll::Pending;
+                self.queue.subscribers.push(actor);
+                self.actor = Some(actor);
+                Poll::Pending
             } else {
-                println!("poll returns ready");
-                return Poll::Ready(self.queue.get().unwrap());
-            }
+                Poll::Ready(self.queue.get().unwrap())
+            }            
+        } else {
+            let any_msg = actor.mailbox.take().unwrap();
+            let msg = any_msg.downcast_mut::<T>().unwrap();
+            Poll::Ready(msg)
         }
     }
 }
 
 struct Message<'a, T> {
     parent: Option<&'a mut Queue<'a, Self>>,
-    payload: T,
-    linkage: Node<Self>
+    linkage: Node<Self>,
+    payload: T
 }
 
+macro_rules! msg_new {
+    ($s:expr) => { 
+        Message { 
+            parent: None, 
+            linkage: Node::new(), 
+            payload: $s
+        }
+    }
+}
+    
 impl<'a, T> Linkable for Message<'a, T> {
     fn to_links(&mut self) -> &mut Node<Self> {
         &mut self.linkage
     }
 }
 
-trait Freeable {
+trait Freeable<'a>: Linkable {
     fn free(&mut self);
-    fn set_parent(&mut self, _: &'static mut Queue<'static, Self>) 
-        where Self: Linkable;
+    fn set_parent(&mut self, _: &'a mut Queue<'a, Self>);
 }
 
-impl<'a, T> Freeable for Message<'a, T> {
+impl<'a, T> Freeable<'a> for Message<'a, T> {
     fn free(&mut self) {       
         if let Some(parent) = self.parent.take() {
             parent.msgs.push(self);
         }
     }
     
-    fn set_parent(&mut self, q: &'static mut Queue<'static, Self>) {
+    fn set_parent(&mut self, q: &'a mut Queue<'a, Self>) {
         self.parent = Some(q);
     }
 }
@@ -282,9 +290,12 @@ struct Pool<'a, T: Linkable, const N: usize> {
     arr: Option<&'a mut [T; N]>
 }
 
-impl<'a: 'static, T: Freeable + Linkable, const N: usize> Pool<'a, T, N> {
-    
-    fn init(&'a mut self, mem: &'a mut [T; N], sched: &'a mut Scheduler<'a, NPRIO>) {
+macro_rules! pool_init {
+    () => { Pool { pool: queue_init!(), used: 0, arr: None } };
+}
+
+impl<'a, T: Freeable<'a>, const N: usize> Pool<'a, T, N> {
+    fn init(&mut self, mem: &'a mut [T; N], sched: &'a mut Scheduler<'a, NPRIO>) {
         self.pool.init(sched);
         self.used = 0;
         self.arr = Some(mem);
@@ -292,24 +303,16 @@ impl<'a: 'static, T: Freeable + Linkable, const N: usize> Pool<'a, T, N> {
     
     fn alloc(&'a mut self) -> Option<&'a mut T> {
         if self.used < N {
-            let val = match &mut self.arr {
-                Some(arr_ref) => Some(&mut arr_ref[self.used]),
-                _ => None
-            };
-            self.used += 1;
-            if val.is_some() {
-                let x = val.unwrap();
-                x.set_parent(&mut self.pool);
-                Some(x)
+            if let Some(ref mut arr) = self.arr {
+                let item = &mut arr[self.used];
+                self.used += 1;
+                item.set_parent(&mut self.pool);
+                Some(item)
             } else {
                 None
             }
         } else {
-            if self.pool.msgs.is_empty() == false {
-                self.pool.msgs.pop()
-            } else {
-                None
-            }
+            self.pool.msgs.pop()
         }
     }
 }
@@ -331,10 +334,10 @@ impl<'a, const NPRIO: usize> Scheduler<'a, NPRIO> {
     }
     
     fn schedule(&mut self, vect: usize) {       
-        let s = &mut self.runq[vect];
-        while s.is_empty() == false {
-            let a = s.pop().unwrap();
-            a.call();           
+        let runq = &mut self.runq[vect];
+        while runq.is_empty() == false {
+            let actor = runq.pop().unwrap();
+            actor.call();           
         }
     }    
 }
@@ -355,13 +358,14 @@ fn waker_ref() -> &'static Waker {
 }
 
 const NPRIO: usize = 1;
-const PROTO: Message<ExampleMsg> = Message { parent: None, payload: ExampleMsg { n: 0 }, linkage: Node::new() };
-const PROTO2: Message<ExampleMsg2> = Message { parent: None, payload: ExampleMsg2 { t: 0 }, linkage: Node::new() };
-static mut ARR: [Message<ExampleMsg>; 2] = [PROTO; 2];
+const PROTO1: Message<ExampleMsg> = msg_new!(ExampleMsg { n: 0 });
+const PROTO2: Message<ExampleMsg2> = msg_new!(ExampleMsg2 { t: 0 });
+    
+static mut ARR1: [Message<ExampleMsg>; 2] = [PROTO1; 2];
 static mut ARR2: [Message<ExampleMsg2>; 2] = [PROTO2; 2];
-static mut POOL: Pool<Message<ExampleMsg>, 2> = Pool { pool: queue_init!(), used: 0, arr: None };
-static mut POOL2: Pool<Message<ExampleMsg2>, 2> = Pool { pool: queue_init!(), used: 0, arr: None };
-static mut QUEUE: Queue<Message<ExampleMsg>> = queue_init!();
+static mut POOL1: Pool<Message<ExampleMsg>, 2> = pool_init!();
+static mut POOL2: Pool<Message<ExampleMsg2>, 2> = pool_init!();
+static mut QUEUE1: Queue<Message<ExampleMsg>> = queue_init!();
 static mut QUEUE2: Queue<Message<ExampleMsg2>> = queue_init!();
 
 struct ExampleMsg {
@@ -373,20 +377,22 @@ struct ExampleMsg2 {
 }
 
 async fn func(this: &mut Actor) -> () {
-    let q = unsafe { &mut QUEUE };
+    let q1 = unsafe { &mut QUEUE1 };
     let q2 = unsafe { &mut QUEUE2 };
-    let mut foo = 0;
+    let mut sum = 0;
     
     loop {
-        println!("before 1st await {}", foo);
-        let t = this.block_on(q).await;
-        foo += t.payload.n;
-        t.free();
-        println!("before 2nd await {}", foo);
-        let m = this.block_on(q2).await;
-        foo += m.payload.t;
-        m.free();
-        println!("loop end {}", foo);
+        println!("before 1st await {}", sum);
+        
+        let msg1 = this.block_on(q1).await;
+        sum += msg1.payload.n;
+        msg1.free();
+        
+        println!("before 2nd await {}", sum);
+        
+        let msg2 = this.block_on(q2).await;
+        sum += msg2.payload.t;
+        msg2.free();
     }
 }
 
@@ -400,9 +406,9 @@ fn main() {
     
     unsafe { 
         SCHED.init();
-        QUEUE.init(&mut SCHED);
+        QUEUE1.init(&mut SCHED);
         QUEUE2.init(&mut SCHED);
-        POOL.init(&mut ARR, &mut SCHED);
+        POOL1.init(&mut ARR1, &mut SCHED);
         POOL2.init(&mut ARR2, &mut SCHED);
     
         let mut f = func(&mut ACTOR1);
@@ -410,9 +416,9 @@ fn main() {
 
         ACTOR1.spawn(&mut f);
         
-        let msg = POOL.alloc().unwrap();
+        let msg = POOL1.alloc().unwrap();
         msg.payload.n = 100;
-        QUEUE.put(msg);
+        QUEUE1.put(msg);
         
         SCHED.schedule(0);
         
@@ -422,10 +428,16 @@ fn main() {
         
         SCHED.schedule(0);
         
-        let msg = POOL.alloc().unwrap();
+        let msg = POOL1.alloc().unwrap();
         msg.payload.n = 1;
-        QUEUE.put(msg);
+        QUEUE1.put(msg);
         
-        SCHED.schedule(0); 
+        SCHED.schedule(0);
+        
+        let msg = POOL2.alloc().unwrap();
+        msg.payload.t = 1000;
+        QUEUE2.put(msg);
+        
+        SCHED.schedule(0);        
     }
 }
