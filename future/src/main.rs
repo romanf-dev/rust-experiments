@@ -12,11 +12,8 @@ struct Node<T> {
 }
 
 impl<T> Node<T> {
-    const fn new() -> Node<T> {
-        Node {
-            links: None,
-            payload: None,
-        }
+    const fn new() -> Node<T> { 
+        Node { links: None, payload: None } 
     }
     
     fn set_next(&mut self, new_next: *mut Node<T>) {
@@ -117,8 +114,8 @@ impl<'a, T: Linkable> Drop for List<'a, T> {
 
 //----------------------------------------------------------------------
 
-struct Queue<'a, T: Linkable> {
-    msgs: List<'a, T>,
+struct Queue<'a, T: Sized> {
+    msgs: List<'a, Message<'a, T>>,
     subscribers: List<'a, Actor>,
     sched_context: Option<&'a mut Scheduler<'a, NPRIO>>
 }
@@ -130,17 +127,21 @@ macro_rules! queue_init {
             subscribers: List::new(), 
             sched_context: None 
         } 
-    };    
+    };
 }
 
-impl<'a, T: Linkable> Queue<'a, T> {
+macro_rules! connect_to {
+    ($q:ident) => { unsafe { &mut $q } };
+}
+
+impl<'a, T: Sized> Queue<'a, T> {
     fn init(&mut self, sched: &'a mut Scheduler<'a, NPRIO>) {
         self.msgs.init();
         self.subscribers.init();
         self.sched_context = Some(sched);
     }
         
-    fn get<'b>(&mut self, actor: &'b mut Actor) -> Option<&'a mut T> {
+    fn get<'b>(&mut self, actor: &'b mut Actor) -> Option<&'a mut Message<'a, T>> {
         if self.msgs.is_empty() {
             self.subscribers.push(actor);
             None
@@ -149,7 +150,7 @@ impl<'a, T: Linkable> Queue<'a, T> {
         }
     }
     
-    fn put(&mut self, item: &'static mut T) {
+    fn put(&mut self, item: &'static mut Message<'a, T>) {
         if self.subscribers.is_empty() {
             self.msgs.push(item);
         } else {
@@ -207,20 +208,20 @@ impl Actor {
         self.call();
     }
     
-    fn block_on<'refs, 'content, T: Linkable>
+    fn block_on<'refs, 'content, T>
         (&'refs mut self, q: &'refs mut Queue<'content, T>) -> MsgFuture<'refs, 'content, T> {
 
         MsgFuture::<T> { queue: Some(q), actor: self }
     }
 }
 
-struct MsgFuture<'a, 'q, T: Linkable> {
-    queue: Option<&'a mut Queue<'q, T>>,
-    actor: &'a mut Actor
+struct MsgFuture<'r, 'q, T> {
+    queue: Option<&'r mut Queue<'q, T>>,
+    actor: &'r mut Actor
 }
 
-impl<'a, 'q, T: Linkable + 'static> Future for MsgFuture<'a, 'q, T> {
-    type Output = &'q mut T;
+impl<'r, 'q: 'static, T> Future for MsgFuture<'r, 'q, T> {
+    type Output = &'q mut Message<'q, T>;
     
     fn poll(mut self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
         if let Some(queue) = self.queue.take() {
@@ -230,13 +231,13 @@ impl<'a, 'q, T: Linkable + 'static> Future for MsgFuture<'a, 'q, T> {
             }           
         } else {
             let msg = self.actor.mailbox.take().unwrap();
-            Poll::Ready(msg.downcast_mut::<T>().unwrap())
+            Poll::Ready(msg.downcast_mut::<Message<'q, T>>().unwrap())
         }
     }
 }
 
 struct Message<'a, T> {
-    parent: Option<&'a mut Queue<'a, Self>>,
+    parent: Option<&'a mut Queue<'a, T>>,
     linkage: Node<Self>,
     payload: T
 }
@@ -264,13 +265,13 @@ impl<'a, T> Message<'a, T> {
         }
     }
     
-    fn set_parent(&mut self, q: &'a mut Queue<'a, Self>) {
+    fn set_parent(&mut self, q: &'a mut Queue<'a, T>) {
         self.parent = Some(q);
     }
 }
 
 struct Pool<'a, T: Sized, const N: usize> {
-    pool: Queue<'a, Message<'a, T>>,
+    pool: Queue<'a, T>,
     used: usize,
     arr: Option<&'a mut [Message<'a, T>; N]>
 }
@@ -350,8 +351,8 @@ static mut ARR1: [Message<ExampleMsg>; 2] = [PROTO1; 2];
 static mut ARR2: [Message<ExampleMsg2>; 2] = [PROTO2; 2];
 static mut POOL1: Pool<ExampleMsg, 2> = pool_init!();
 static mut POOL2: Pool<ExampleMsg2, 2> = pool_init!();
-static mut QUEUE1: Queue<Message<ExampleMsg>> = queue_init!();
-static mut QUEUE2: Queue<Message<ExampleMsg2>> = queue_init!();
+static mut QUEUE1: Queue<ExampleMsg> = queue_init!();
+static mut QUEUE2: Queue<ExampleMsg2> = queue_init!();
 
 struct ExampleMsg {
     n: u32
@@ -362,10 +363,10 @@ struct ExampleMsg2 {
 }
 
 async fn func(this: &mut Actor) {
-    let q1 = unsafe { &mut QUEUE1 };
-    let q2 = unsafe { &mut QUEUE2 };
+    let q1 = connect_to!(QUEUE1);
+    let q2 = connect_to!(QUEUE2);
     let mut sum = 0;
-    
+        
     loop {
         println!("before 1st await {}", sum);
         
@@ -401,28 +402,18 @@ fn main() {
 
         ACTOR1.spawn(&mut f);
         
-        let msg = POOL1.alloc().unwrap();
-        msg.payload.n = 100;
-        QUEUE1.put(msg);
-        
-        SCHED.schedule(0);
-        
-        let msg = POOL2.alloc().unwrap();
-        msg.payload.t = 10;
-        QUEUE2.put(msg);
-        
-        SCHED.schedule(0);
-        
-        let msg = POOL1.alloc().unwrap();
-        msg.payload.n = 1;
-        QUEUE1.put(msg);
-        
-        SCHED.schedule(0);
-        
-        let msg = POOL2.alloc().unwrap();
-        msg.payload.t = 1000;
-        QUEUE2.put(msg);
-        
-        SCHED.schedule(0);        
+        for _ in 0..2 {
+            let msg = POOL1.alloc().unwrap();
+            msg.payload.n = 10;
+            QUEUE1.put(msg);
+            
+            SCHED.schedule(0);
+            
+            let msg = POOL2.alloc().unwrap();
+            msg.payload.t = 100;
+            QUEUE2.put(msg);
+            
+            SCHED.schedule(0);
+        }
     }
 }
