@@ -257,12 +257,7 @@ impl<'a, T> Linkable for Message<'a, T> {
     }
 }
 
-trait Freeable<'a>: Linkable {
-    fn free(&mut self);
-    fn set_parent(&mut self, _: &'a mut Queue<'a, Self>);
-}
-
-impl<'a, T> Freeable<'a> for Message<'a, T> {
+impl<'a, T> Message<'a, T> {
     fn free(&mut self) {       
         if let Some(parent) = self.parent.take() {
             parent.msgs.push(self);
@@ -274,24 +269,24 @@ impl<'a, T> Freeable<'a> for Message<'a, T> {
     }
 }
 
-struct Pool<'a, T: Linkable, const N: usize> {
-    pool: Queue<'a, T>,
+struct Pool<'a, T: Sized, const N: usize> {
+    pool: Queue<'a, Message<'a, T>>,
     used: usize,
-    arr: Option<&'a mut [T; N]>
+    arr: Option<&'a mut [Message<'a, T>; N]>
 }
 
 macro_rules! pool_init {
     () => { Pool { pool: queue_init!(), used: 0, arr: None } };
 }
 
-impl<'a, T: Freeable<'a>, const N: usize> Pool<'a, T, N> {
-    fn init(&mut self, mem: &'a mut [T; N], sched: &'a mut Scheduler<'a, NPRIO>) {
+impl<'a, T: Sized, const N: usize> Pool<'a, T, N> {
+    fn init(&mut self, mem: &'a mut [Message<'a, T>; N], sched: &'a mut Scheduler<'a, NPRIO>) {
         self.pool.init(sched);
         self.used = 0;
         self.arr = Some(mem);
     }
     
-    fn alloc(&'a mut self) -> Option<&'a mut T> {
+    fn alloc(&'a mut self) -> Option<&'a mut Message<'a, T>> {
         if self.used < N {
             if let Some(ref mut arr) = self.arr {
                 let item = &mut arr[self.used];
@@ -353,8 +348,8 @@ const PROTO2: Message<ExampleMsg2> = msg_new!(ExampleMsg2 { t: 0 });
     
 static mut ARR1: [Message<ExampleMsg>; 2] = [PROTO1; 2];
 static mut ARR2: [Message<ExampleMsg2>; 2] = [PROTO2; 2];
-static mut POOL1: Pool<Message<ExampleMsg>, 2> = pool_init!();
-static mut POOL2: Pool<Message<ExampleMsg2>, 2> = pool_init!();
+static mut POOL1: Pool<ExampleMsg, 2> = pool_init!();
+static mut POOL2: Pool<ExampleMsg2, 2> = pool_init!();
 static mut QUEUE1: Queue<Message<ExampleMsg>> = queue_init!();
 static mut QUEUE2: Queue<Message<ExampleMsg2>> = queue_init!();
 
