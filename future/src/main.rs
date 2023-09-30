@@ -114,128 +114,6 @@ impl<'a, T: Linkable> Drop for List<'a, T> {
 
 //----------------------------------------------------------------------
 
-struct Queue<'a, T: Sized> {
-    msgs: List<'a, Message<'a, T>>,
-    subscribers: List<'a, Actor>,
-    sched_context: Option<&'a mut Scheduler<'a, NPRIO>>
-}
-
-macro_rules! queue_init {
-    () => { 
-        Queue { 
-            msgs: List::new(), 
-            subscribers: List::new(), 
-            sched_context: None 
-        } 
-    };
-}
-
-macro_rules! connect_to {
-    ($q:ident) => { unsafe { &mut $q } };
-}
-
-impl<'a, T: Sized> Queue<'a, T> {
-    fn init(&mut self, sched: &'a mut Scheduler<'a, NPRIO>) {
-        self.msgs.init();
-        self.subscribers.init();
-        self.sched_context = Some(sched);
-    }
-        
-    fn get<'b>(&mut self, actor: &'b mut Actor) -> Option<&'a mut Message<'a, T>> {
-        if self.msgs.is_empty() {
-            self.subscribers.push(actor);
-            None
-        } else {
-            self.msgs.pop()
-        }
-    }
-    
-    fn put(&mut self, item: &'static mut Message<'a, T>) {
-        if self.subscribers.is_empty() {
-            self.msgs.push(item);
-        } else {
-            let actor = self.subscribers.pop().unwrap();
-            actor.mailbox = Some(item);
-            
-            if let Some(ref mut sched) = self.sched_context {
-                sched.runq[actor.prio].push(actor)
-            }
-        }
-    }
-}
-
-struct Actor {
-    prio: usize,
-    mailbox: Option<&'static mut dyn Any>,
-    future: Option<Pin<&'static mut dyn Future<Output = ()>>>,
-    linkage: Node<Self>
-}
-
-macro_rules! actor_init {
-    () => { 
-        Actor { 
-            prio: 0, 
-            mailbox: None, 
-            future: None, 
-            linkage: Node::new() 
-        } 
-    };
-}
-
-impl Linkable for Actor {
-    fn to_links(&mut self) -> &mut Node<Self> {
-        &mut self.linkage
-    }
-}
-
-impl Actor {
-    fn call(&mut self) {   
-        let waker = waker_ref();
-        let mut cx = core::task::Context::from_waker(waker);
-        
-        if let Some(ref mut future) = self.future {
-            let _ = future.as_mut().poll(&mut cx);
-        }
-    }    
-
-    fn spawn(&mut self, f: &mut (impl Future<Output=()> + 'static)) {
-        fn to_static<'x, T>(v: &'x mut T) -> &'static mut T {
-            unsafe { mem::transmute(v) }
-        }        
-        
-        let s = to_static(f);
-        unsafe { self.future = Some(Pin::new_unchecked(s)); }
-        self.call();
-    }
-    
-    fn block_on<'refs, 'content, T>
-        (&'refs mut self, q: &'refs mut Queue<'content, T>) -> MsgFuture<'refs, 'content, T> {
-
-        MsgFuture::<T> { queue: Some(q), actor: self }
-    }
-}
-
-struct MsgFuture<'r, 'q, T> {
-    queue: Option<&'r mut Queue<'q, T>>,
-    actor: &'r mut Actor
-}
-
-impl<'r, 'q: 'static, T> Future for MsgFuture<'r, 'q, T> {
-    type Output = &'q mut Message<'q, T>;
-    
-    fn poll(mut self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
-        if let Some(queue) = self.queue.take() {
-            match queue.get(self.actor) {
-                Some(msg) =>  Poll::Ready(msg),
-                None => Poll::Pending
-            }           
-        } else {
-            let msg = self.actor.mailbox.take().unwrap();
-            Poll::Ready(msg.downcast_mut::<Message<'q, T>>().unwrap())
-        }
-    }
-}
-
 struct Message<'a, T> {
     parent: Option<&'a mut Queue<'a, T>>,
     linkage: Node<Self>,
@@ -270,6 +148,144 @@ impl<'a, T> Message<'a, T> {
     }
 }
 
+struct Queue<'a, T: Sized> {
+    msgs: List<'a, Message<'a, T>>,
+    subscribers: List<'a, Actor>
+}
+
+macro_rules! queue_init {
+    () => { 
+        Queue { 
+            msgs: List::new(), 
+            subscribers: List::new(),
+        } 
+    };
+}
+
+macro_rules! connect_to {
+    ($q:ident) => { unsafe { &mut $q } };
+}
+
+impl<'a, T: Sized> Queue<'a, T> {
+    fn init(&mut self) {
+        self.msgs.init();
+        self.subscribers.init();
+    }
+        
+    fn get<'b>(&mut self, actor: &'b mut Actor) -> Option<&'a mut Message<'a, T>> {
+        if self.msgs.is_empty() {
+            self.subscribers.push(actor);
+            None
+        } else {
+            self.msgs.pop()
+        }
+    }
+    
+    fn put(&mut self, item: &'static mut Message<'a, T>) {
+        if self.subscribers.is_empty() {
+            self.msgs.push(item);
+        } else {
+            let actor = self.subscribers.pop().unwrap();
+            actor.mailbox = Some(item);
+            let sched = actor.context.take().unwrap();
+            sched.runq[actor.prio].push(actor);
+            actor.context = Some(sched);
+        }
+    }
+}
+
+const NPRIO: usize = 1;
+
+struct Actor {
+    prio: usize,
+    mailbox: Option<&'static mut dyn Any>,
+    future: Option<Pin<&'static mut dyn Future<Output = ()>>>,
+    context: Option<&'static mut Scheduler<'static, NPRIO>>,
+    linkage: Node<Self>
+}
+
+macro_rules! actor_init {
+    () => { 
+        Actor { 
+            prio: 0, 
+            mailbox: None, 
+            future: None,
+            context: None,
+            linkage: Node::new() 
+        } 
+    };
+}
+
+impl Linkable for Actor {
+    fn to_links(&mut self) -> &mut Node<Self> {
+        &mut self.linkage
+    }
+}
+
+const fn noop_raw_waker() -> RawWaker {
+    RawWaker::new(null(), &NOOP_WAKER_VTABLE)
+}
+
+const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |_| noop_raw_waker(), |_| {}, |_| {}, |_| {}
+);
+
+fn waker_ref() -> &'static Waker {
+    struct SyncRawWaker(RawWaker);
+    unsafe impl Sync for SyncRawWaker {}
+    static NOOP_WAKER_INSTANCE: SyncRawWaker = SyncRawWaker(noop_raw_waker());
+    unsafe { &*(&NOOP_WAKER_INSTANCE.0 as *const RawWaker as *const Waker) }
+}
+
+impl Actor {
+    fn call(&mut self) {   
+        let waker = waker_ref();
+        let mut cx = core::task::Context::from_waker(waker);
+        
+        if let Some(ref mut future) = self.future {
+            let _ = future.as_mut().poll(&mut cx);
+        }
+    }    
+
+    fn spawn(&mut self, sched: &'static mut Scheduler<'static, NPRIO>, f: &mut (impl Future<Output=()> + 'static)) {
+        fn to_static<'x, T>(v: &'x mut T) -> &'static mut T {
+            unsafe { mem::transmute(v) }
+        }        
+        
+        let s = to_static(f);
+        unsafe { self.future = Some(Pin::new_unchecked(s)); }
+        self.context = Some(sched);
+        self.call();
+    }
+    
+    fn block_on<'refs, 'content, T>
+        (&'refs mut self, q: &'refs mut Queue<'content, T>) -> MsgFuture<'refs, 'content, T> {
+
+        MsgFuture::<T> { queue: Some(q), actor: self }
+    }
+}
+
+struct MsgFuture<'r, 'q, T> {
+    queue: Option<&'r mut Queue<'q, T>>,
+    actor: &'r mut Actor
+}
+
+impl<'r, 'q: 'static, T> Future for MsgFuture<'r, 'q, T> {
+    type Output = &'q mut Message<'q, T>;
+    
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
+        if let Some(queue) = self.queue.take() {
+            match queue.get(self.actor) {
+                Some(msg) =>  Poll::Ready(msg),
+                None => Poll::Pending
+            }           
+        } else {
+            let msg = self.actor.mailbox.take().unwrap();
+            Poll::Ready(msg.downcast_mut::<Message<'q, T>>().unwrap())
+        }
+    }
+}
+
 struct Pool<'a, T: Sized, const N: usize> {
     pool: Queue<'a, T>,
     used: usize,
@@ -281,8 +297,8 @@ macro_rules! pool_init {
 }
 
 impl<'a, T: Sized, const N: usize> Pool<'a, T, N> {
-    fn init(&mut self, mem: &'a mut [Message<'a, T>; N], sched: &'a mut Scheduler<'a, NPRIO>) {
-        self.pool.init(sched);
+    fn init(&mut self, mem: &'a mut [Message<'a, T>; N]) {
+        self.pool.init();
         self.used = 0;
         self.arr = Some(mem);
     }
@@ -328,27 +344,8 @@ impl<'a, const NPRIO: usize> Scheduler<'a, NPRIO> {
     }    
 }
 
-const fn noop_raw_waker() -> RawWaker {
-    RawWaker::new(null(), &NOOP_WAKER_VTABLE)
-}
+//----------------------------------------------------------------------
 
-const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |_| noop_raw_waker(), |_| {}, |_| {}, |_| {}
-);
-
-fn waker_ref() -> &'static Waker {
-    struct SyncRawWaker(RawWaker);
-    unsafe impl Sync for SyncRawWaker {}
-    static NOOP_WAKER_INSTANCE: SyncRawWaker = SyncRawWaker(noop_raw_waker());
-    unsafe { &*(&NOOP_WAKER_INSTANCE.0 as *const RawWaker as *const Waker) }
-}
-
-const NPRIO: usize = 1;
-const PROTO1: Message<ExampleMsg> = msg_new!(ExampleMsg { n: 0 });
-const PROTO2: Message<ExampleMsg2> = msg_new!(ExampleMsg2 { t: 0 });
-    
-static mut ARR1: [Message<ExampleMsg>; 2] = [PROTO1; 2];
-static mut ARR2: [Message<ExampleMsg2>; 2] = [PROTO2; 2];
 static mut POOL1: Pool<ExampleMsg, 2> = pool_init!();
 static mut POOL2: Pool<ExampleMsg2, 2> = pool_init!();
 static mut QUEUE1: Queue<ExampleMsg> = queue_init!();
@@ -387,20 +384,26 @@ fn get_size<F: Future>(_: &mut F) -> usize {
 }
 
 fn main() {
+    const PROTO1: Message<ExampleMsg> = msg_new!(ExampleMsg { n: 0 });
+    const PROTO2: Message<ExampleMsg2> = msg_new!(ExampleMsg2 { t: 0 });
+           
+    static mut ARR1: [Message<ExampleMsg>; 2] = [PROTO1; 2];
+    static mut ARR2: [Message<ExampleMsg2>; 2] = [PROTO2; 2];
+    
     static mut ACTOR1: Actor = actor_init!();
     static mut SCHED: Scheduler<NPRIO> = Scheduler::new();
     
     unsafe { 
         SCHED.init();
-        QUEUE1.init(&mut SCHED);
-        QUEUE2.init(&mut SCHED);
-        POOL1.init(&mut ARR1, &mut SCHED);
-        POOL2.init(&mut ARR2, &mut SCHED);
+        QUEUE1.init();
+        QUEUE2.init();
+        POOL1.init(&mut ARR1);
+        POOL2.init(&mut ARR2);
     
         let mut f = func(&mut ACTOR1);
         println!("future size = {}", get_size(&mut f));
 
-        ACTOR1.spawn(&mut f);
+        ACTOR1.spawn(&mut SCHED, &mut f);
         
         for _ in 0..2 {
             let msg = POOL1.alloc().unwrap();
