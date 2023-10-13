@@ -26,7 +26,7 @@ impl<T> Node<T> {
         }
     }
     
-    fn to_obj(&self) -> &mut T {
+    fn to_obj<'a>(&self) -> &'a mut T {
         let ptr = self.payload.take().unwrap();
         unsafe { &mut *ptr }
     }
@@ -54,7 +54,7 @@ impl<'a, T: Linkable> List<'a, T> {
         self.root.links.set(Some((this, this)));
     }
 
-    fn get_head(&self) -> Option<&Node<T>> {
+    fn peek_head_node(&self) -> Option<&Node<T>> {
         match self.root.links.get() { 
             Some((_, next)) => 
                 if next != &self.root { 
@@ -66,18 +66,22 @@ impl<'a, T: Linkable> List<'a, T> {
         }
     }
     
-    fn push<'b>(&self, object: &'b mut T) {
+    fn is_empty(&self) -> bool {
+        self.peek_head_node().is_none()
+    }
+    
+    fn enqueue<'b: 'a>(&self, object: &'b mut T) {
         let ptr: *mut T = object;
         let node = object.to_links();
         let (prev, next) = self.root.links.take().unwrap();
         node.links.set(Some((prev, &self.root as *const Node<T>)));
+        node.payload.set(Some(ptr));
         self.root.links.set(Some((node, next)));
         unsafe { (*prev).set_next(node); }
-        node.payload.set(Some(ptr));
     }
 
-    fn pop(&self) -> Option<&mut T> {
-        if let Some(node) = self.get_head() {
+    fn dequeue<'b: 'a>(&self) -> Option<&'b mut T> {
+        if let Some(node) = self.peek_head_node() {
             let (prev, next) = node.links.take().unwrap();
 
             unsafe {
@@ -85,9 +89,10 @@ impl<'a, T: Linkable> List<'a, T> {
                 (*next).set_prev(prev);
             }
             
-            return Some(node.to_obj());
+            Some(node.to_obj())
+        } else {
+            None
         }
-        None
     }
 }
 
@@ -114,12 +119,14 @@ fn main() {
 
     unsafe {
         LIST.init();
-        LIST.push(&mut items[0]);
-        LIST.push(&mut items[1]);
-        LIST.push(&mut items[2]);
-        LIST.push(&mut items[3]);
-                
-        while let Some(val) = LIST.pop() {
+        LIST.enqueue(&mut items[0]);
+        LIST.enqueue(&mut items[1]);
+        LIST.enqueue(&mut items[2]);
+        LIST.enqueue(&mut items[3]);
+        
+        assert!(LIST.is_empty() == false);
+        
+        while let Some(val) = LIST.dequeue() {
             println!("val = {}", val.foo);
         }
     }
