@@ -5,44 +5,41 @@ use core::ptr::null;
 use core::mem;
 use core::marker::PhantomData;
 use core::any::Any;
+use core::cell::Cell;
 
 struct Node<T> {
-    links: Option<(*mut Node<T>, *mut Node<T>)>,
-    payload: Option<*mut T>,
+    links: Cell<Option<(*const Node<T>, *const Node<T>)>>,
+    payload: Cell<Option<*mut T>>,
 }
 
 impl<T> Node<T> {
-    const fn new() -> Node<T> { 
-        Node { links: None, payload: None } 
-    }
-    
-    fn set_next(&mut self, new_next: *mut Node<T>) {
-        if let Some((prev, _)) = self.links {
-            self.links = Some((prev, new_next));
+    const fn new() -> Node<T> {
+        Node {
+            links: Cell::new(None),
+            payload: Cell::new(None),
         }
     }
     
-    fn set_prev(&mut self, new_prev: *mut Node<T>) {
-        if let Some((_, next)) = self.links {
-            self.links = Some((new_prev, next));
+    fn set_next(&self, new_next: *const Node<T>) {
+        if let Some((prev, _)) = self.links.take() {
+            self.links.set(Some((prev, new_next)));
         }
     }
     
-    fn to_obj<'a>(&mut self) -> &'a mut T {
-        assert!(self.links.is_none());
+    fn set_prev(&self, new_prev: *const Node<T>) {
+        if let Some((_, next)) = self.links.take() {
+            self.links.set(Some((new_prev, next)));
+        }
+    }
+    
+    fn to_obj<'a>(&self) -> &'a mut T {
         let ptr = self.payload.take().unwrap();
         unsafe { &mut *ptr }
-    } 
-}
-
-impl<T> Drop for Node<T> {
-    fn drop(&mut self) {
-        assert!(self.links.is_none());
     }
 }
 
-trait Linkable: Sized { 
-    fn to_links(&mut self) -> &mut Node<Self>;
+trait Linkable: Sized {
+    fn to_links(&self) -> &Node<Self>;
 }
 
 struct List<'a, T: Linkable> {
@@ -58,38 +55,38 @@ impl<'a, T: Linkable> List<'a, T> {
         }
     }
 
-    fn init(&mut self) {
-        let this = (&mut self.root) as *mut Node<T>;
-        self.root.links = Some((this, this));
+    fn init(&self) {
+        let this = (&self.root) as *const Node<T>;
+        self.root.links.set(Some((this, this)));
     }
 
-    fn peek_head_node(&self) -> Option<&mut Node<T>> {
-        match self.root.links { 
+    fn peek_head_node(&self) -> Option<&Node<T>> {
+        match self.root.links.get() { 
             Some((_, next)) => 
-                if next as *const Node<T> != &self.root { 
-                    unsafe { Some(&mut *next) } 
+                if next != &self.root { 
+                    unsafe { Some(&*next) } 
                 } else { 
                     None 
                 },
             _ => None
-        }       
+        }
     }
     
     fn is_empty(&self) -> bool {
         self.peek_head_node().is_none()
     }
     
-    fn push<'b>(&mut self, object: &'b mut T) {
+    fn enqueue<'b: 'a>(&self, object: &'b mut T) {
         let ptr: *mut T = object;
         let node = object.to_links();
         let (prev, next) = self.root.links.take().unwrap();
-        node.links = Some((prev, &mut self.root));
-        node.payload = Some(ptr);
-        self.root.links = Some((node, next));
+        node.links.set(Some((prev, &self.root as *const Node<T>)));
+        node.payload.set(Some(ptr));
+        self.root.links.set(Some((node, next)));
         unsafe { (*prev).set_next(node); }
     }
 
-    fn pop<'b>(&mut self) -> Option<&'b mut T> {
+    fn dequeue<'b: 'a>(&self) -> Option<&'b mut T> {
         if let Some(node) = self.peek_head_node() {
             let (prev, next) = node.links.take().unwrap();
 
@@ -102,13 +99,6 @@ impl<'a, T: Linkable> List<'a, T> {
         } else {
             None
         }
-    }
-}
-
-impl<'a, T: Linkable> Drop for List<'a, T> {
-    fn drop(&mut self) {
-        assert!(self.peek_head_node().is_none());
-        self.root.links = None;
     }
 }
 
@@ -131,15 +121,15 @@ macro_rules! msg_new {
 }
     
 impl<'a, T> Linkable for Message<'a, T> {
-    fn to_links(&mut self) -> &mut Node<Self> {
-        &mut self.linkage
+    fn to_links(&self) -> &Node<Self> {
+        &self.linkage
     }
 }
 
 impl<'a, T> Message<'a, T> {
     fn free(&mut self) {       
         if let Some(parent) = self.parent.take() {
-            parent.msgs.push(self);
+            parent.msgs.enqueue(self);
         }
     }
     
@@ -174,21 +164,21 @@ impl<'a, T: Sized> Queue<'a, T> {
         
     fn get<'b>(&mut self, actor: &'b mut Actor) -> Option<&'a mut Message<'a, T>> {
         if self.msgs.is_empty() {
-            self.subscribers.push(actor);
+            self.subscribers.enqueue(actor);
             None
         } else {
-            self.msgs.pop()
+            self.msgs.dequeue()
         }
     }
     
     fn put(&mut self, item: &'static mut Message<'a, T>) {
         if self.subscribers.is_empty() {
-            self.msgs.push(item);
+            self.msgs.enqueue(item);
         } else {
-            let actor = self.subscribers.pop().unwrap();
+            let actor = self.subscribers.dequeue().unwrap();
             actor.mailbox = Some(item);
             let sched = actor.context.take().unwrap();
-            sched.runq[actor.prio].push(actor);
+            sched.runq[actor.prio].enqueue(actor);
             actor.context = Some(sched);
         }
     }
@@ -217,8 +207,8 @@ macro_rules! actor_init {
 }
 
 impl Linkable for Actor {
-    fn to_links(&mut self) -> &mut Node<Self> {
-        &mut self.linkage
+    fn to_links(&self) -> &Node<Self> {
+        &self.linkage
     }
 }
 
@@ -314,7 +304,7 @@ impl<'a, T: Sized, const N: usize> Pool<'a, T, N> {
                 None
             }
         } else {
-            self.pool.msgs.pop()
+            self.pool.msgs.dequeue()
         }
     }
 }
@@ -338,7 +328,7 @@ impl<'a, const NPRIO: usize> Scheduler<'a, NPRIO> {
     fn schedule(&mut self, vect: usize) {       
         let runq = &mut self.runq[vect];
         while runq.is_empty() == false {
-            let actor = runq.pop().unwrap();
+            let actor = runq.dequeue().unwrap();
             actor.call();           
         }
     }    
