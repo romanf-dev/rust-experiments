@@ -39,6 +39,16 @@ const RCC_CFGR_SWS_PLL: u32 = 8;
 const FLASH_ACR_PRFTBE: u32 = 1 << 4;
 const FLASH_ACR_LATENCY_1: u32 = 2 << 0;
 
+unsafe fn bit_set(addr: &mut u32, bits: u32) -> () {
+    let value = read_volatile(addr);
+    write_volatile(addr, value | bits);
+}
+
+unsafe fn bit_clear(addr: &mut u32, bits: u32) -> () {
+    let value = read_volatile(addr);
+    write_volatile(addr, value & !bits);
+}
+
 #[no_mangle]
 pub fn _start() -> ! {
     let rcc_raw = 0x40021000 as *mut RCC;
@@ -50,7 +60,7 @@ pub fn _start() -> ! {
         //
         // Enable HSE and wait until it is ready.
         //
-        write_volatile(&mut rcc.cr, read_volatile(&rcc.cr) | RCC_CR_HSEON);
+        bit_set(&mut rcc.cr, RCC_CR_HSEON);
         while (read_volatile(&rcc.cr) & RCC_CR_HSERDY) == 0 {}
 
         //
@@ -61,25 +71,30 @@ pub fn _start() -> ! {
         //
         // Switch to HSE, configure PLL multiplier and set HSE as PLL source.
         //
-        write_volatile(&mut rcc.cfgr, read_volatile(&rcc.cfgr) | RCC_CFGR_SW_HSE | RCC_CFGR_PLLMULL9 | RCC_CFGR_PLLSRC);
+        bit_set(&mut rcc.cfgr, RCC_CFGR_SW_HSE | RCC_CFGR_PLLMULL9 | RCC_CFGR_PLLSRC);
 
         //
         // Enable PLL and wait until it is ready.
         //
-        write_volatile(&mut rcc.cr, read_volatile(&rcc.cr) | RCC_CR_PLLON);
+        bit_set(&mut rcc.cr, RCC_CR_PLLON);
         while (read_volatile(&rcc.cr) & RCC_CR_PLLRDY) == 0 {}
 
         //
         // Set PLL as clock source and wait until it switches.
         //
-        write_volatile(&mut rcc.cfgr, (read_volatile(&rcc.cfgr) | RCC_CFGR_SW_PLL) & !RCC_CFGR_SW_HSE);
+        let mut cfgr = read_volatile(&rcc.cfgr);
+
+        bit_set(&mut cfgr, RCC_CFGR_SW_PLL);
+        bit_clear(&mut cfgr, RCC_CFGR_SW_HSE);
+
+        write_volatile(&mut rcc.cfgr, cfgr);
         while (read_volatile(&rcc.cfgr) & RCC_CFGR_SWS_PLL) == 0 {}
 
         //
         // The CPU is now running at 72MHz frequency.
         // It is safe to disable HSI.
         //
-        write_volatile(&mut rcc.cr, read_volatile(&rcc.cr) & !RCC_CR_HSION);
+        bit_clear(&mut rcc.cr, RCC_CR_HSION);
     }
 
     loop {}
