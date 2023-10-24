@@ -1,5 +1,34 @@
 use core::marker::PhantomData;
 use core::cell::Cell;
+use core::ops::DerefMut;
+use core::ops::Deref;
+
+struct RefOwner<'a, T> {
+    inner: Option<&'a mut T>
+}
+
+impl<'a, T> RefOwner<'a, T> {
+    fn new(r: &'a mut T) -> Self {
+        Self {
+            inner: Some(r)
+        }
+    }
+}
+
+impl<'a, T> Deref for RefOwner<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        assert!(self.inner.is_some());
+        self.inner.as_deref().unwrap()
+    }
+}
+
+impl<'a, T> DerefMut for RefOwner<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        assert!(self.inner.is_some());
+        self.inner.as_deref_mut().unwrap()
+    }
+}
 
 struct Node<T> {
     links: Cell<Option<(*const Node<T>, *const Node<T>)>>,
@@ -26,9 +55,18 @@ impl<T> Node<T> {
         }
     }
     
-    fn to_obj<'a>(&self) -> &'a mut T {
+    fn unlink(&self) {   
+        if let Some((prev, next)) = self.links.take() {
+            unsafe {
+                (*prev).set_next(next);
+                (*next).set_prev(prev);
+            }
+        }
+    }
+
+    fn to_obj<'a>(&self) -> RefOwner<'a, T> {
         let ptr = self.payload.take().unwrap();
-        unsafe { &mut *ptr }
+        unsafe { RefOwner::new(&mut *ptr) }
     }
 }
 
@@ -38,7 +76,7 @@ trait Linkable: Sized {
 
 struct List<'a, T: Linkable> {
     root: Node<T>,
-    _marker: PhantomData<&'a T>,
+    _marker: PhantomData<Cell<&'a T>>,
 }
 
 impl<'a, T: Linkable> List<'a, T> {
@@ -70,7 +108,8 @@ impl<'a, T: Linkable> List<'a, T> {
         self.peek_head_node().is_none()
     }
     
-    fn enqueue<'b: 'a>(&self, object: &'b mut T) {
+    fn enqueue(&self, mut wrapper: RefOwner<'a, T>) {
+        let object = wrapper.inner.take().unwrap();
         let ptr: *mut T = object;
         let node = object.to_links();
         let (prev, next) = self.root.links.take().unwrap();
@@ -80,15 +119,9 @@ impl<'a, T: Linkable> List<'a, T> {
         unsafe { (*prev).set_next(node); }
     }
 
-    fn dequeue<'b: 'a>(&self) -> Option<&'b mut T> {
+    fn dequeue(&self) -> Option<RefOwner<'a, T>> {
         if let Some(node) = self.peek_head_node() {
-            let (prev, next) = node.links.take().unwrap();
-
-            unsafe {
-                (*prev).set_next(next);
-                (*next).set_prev(prev);
-            }
-            
+            node.unlink();
             Some(node.to_obj())
         } else {
             None
@@ -106,28 +139,30 @@ impl Linkable for Item {
         &self.linkage
     }
 }
-
-static mut LIST: List<Item> = List::<Item>::new();
-
+    
 fn main() {
-    let mut items: [Item; 4] = [
-        Item { foo: 1, linkage: Node::new() },
-        Item { foo: 2, linkage: Node::new() },
-        Item { foo: 3, linkage: Node::new() },
-        Item { foo: 4, linkage: Node::new() },
-    ];
 
-    unsafe {
-        LIST.init();
-        LIST.enqueue(&mut items[0]);
-        LIST.enqueue(&mut items[1]);
-        LIST.enqueue(&mut items[2]);
-        LIST.enqueue(&mut items[3]);
-        
-        assert!(LIST.is_empty() == false);
-        
-        while let Some(val) = LIST.dequeue() {
-            println!("val = {}", val.foo);
-        }
+    let list: List<Item> = List::<Item>::new();
+
+    let mut item0: Item = Item { foo: 1, linkage: Node::new() };
+    let mut item1: Item = Item { foo: 2, linkage: Node::new() };
+    let mut item2: Item = Item { foo: 3, linkage: Node::new() };
+    let mut item3: Item = Item { foo: 4, linkage: Node::new() };
+
+    let i0 = RefOwner::new(&mut item0);
+    let i1 = RefOwner::new(&mut item1);
+    let i2 = RefOwner::new(&mut item2);
+    let i3 = RefOwner::new(&mut item3);
+    
+    list.init();
+    list.enqueue(i0);
+    list.enqueue(i1);
+    list.enqueue(i2);
+    list.enqueue(i3);
+    
+    assert!(list.is_empty() == false);
+    
+    while let Some(val) = list.dequeue() {
+        println!("val = {}", val.foo);
     }
 }
