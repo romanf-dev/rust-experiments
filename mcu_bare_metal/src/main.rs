@@ -15,17 +15,45 @@ pub fn _exception() -> ! {
     loop {}
 }
 
-#[no_mangle]
-pub fn _interrupt() -> ! {
-    loop {}
-}
-
 #[repr(C)]
 struct RCC {
     cr: u32,
-    cfgr: u32
+    cfgr: u32,
+    cir: u32,
+    apb2rstr: u32,
+    apb1rstr: u32,
+    ahbenr: u32,
+    apb2enr: u32,
+    apb1enr: u32,
+    bdcr: u32,
+    csr: u32
 }
 
+#[repr(C)]
+struct GPIO {
+    crl: u32,
+    crh: u32,
+    idr: u32,
+    odr: u32,
+    bsrr: u32,
+    brr: u32,
+    lckr: u32
+}
+
+#[repr(C)]
+struct SysTick {
+    ctrl: u32,
+    load: u32,
+    val: u32,
+    calib: u32
+}
+
+const GPIO_CRH_CNF13_0: u32 = 1 << 22;
+const GPIO_CRH_MODE13_1: u32 = 2 << 20;
+const GPIO_BSRR_BR13: u32 =  1 << 29;
+const GPIO_BSRR_BS13: u32 =  1 << 13;
+
+const RCC_APB2ENR_IOPCEN: u32 = 1 << 4;
 const RCC_CR_HSION: u32 = 1 << 0;
 const RCC_CR_HSEON: u32 = 1 << 16;
 const RCC_CR_HSERDY: u32 = 1 << 17;
@@ -47,6 +75,22 @@ unsafe fn bit_set(addr: &mut u32, bits: u32) -> () {
 unsafe fn bit_clear(addr: &mut u32, bits: u32) -> () {
     let value = read_volatile(addr);
     write_volatile(addr, value & !bits);
+}
+
+#[no_mangle]
+pub fn _interrupt() {
+    static mut LED: bool = false;
+
+    unsafe {
+        let gpio = &mut *(0x40011000 as *mut GPIO);
+        LED = !LED;
+
+        if LED {
+            write_volatile(&mut gpio.bsrr, GPIO_BSRR_BR13);
+        } else {
+            write_volatile(&mut gpio.bsrr, GPIO_BSRR_BS13);
+        }
+    }
 }
 
 #[no_mangle]
@@ -95,6 +139,21 @@ pub fn _start() -> ! {
         // It is safe to disable HSI.
         //
         bit_clear(&mut rcc.cr, RCC_CR_HSION);
+
+        //
+        // Configure the Systick and LED.
+        // 
+        {
+            let gpio = &mut *(0x40011000 as *mut GPIO);
+            let systick = &mut *(0xe000e010 as *mut SysTick);
+
+            bit_set(&mut rcc.apb2enr, RCC_APB2ENR_IOPCEN);
+            bit_set(&mut gpio.crh, GPIO_CRH_CNF13_0 | GPIO_CRH_MODE13_1);
+
+            write_volatile(&mut systick.load, 72000 * 100);
+            write_volatile(&mut systick.val, 0);
+            write_volatile(&mut systick.ctrl, 7);
+        }
     }
 
     loop {}
