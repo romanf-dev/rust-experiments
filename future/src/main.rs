@@ -1,13 +1,33 @@
+#![feature(const_mut_refs)]
+#![feature(waker_getters)]
+
 use core::mem;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker, RawWakerVTable, RawWaker};
-use core::ptr::null;
 use core::marker::PhantomData;
 use core::any::Any;
 use core::cell::{Cell, OnceCell};
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+struct LockedRegion {
+    old_mask: usize
+}
+
+impl LockedRegion {
+    fn new() -> Self {
+        Self {
+            old_mask: unsafe { interrupt_control(0) }
+        }
+    }
+}
+
+impl Drop for LockedRegion {
+    fn drop(&mut self) {
+        unsafe { interrupt_control(self.old_mask) };
+    }
+}
 
 struct Ref<'a, T>(Option<&'a mut T>);
 
@@ -120,14 +140,14 @@ impl<'a, T: Linkable> List<'a, T> {
     }
 }
 
-struct Message<'a, T> {
+pub struct Message<'a, T> {
     parent: OnceCell<&'a Queue<'a, T>>,
     linkage: Node<Self>,
     payload: T
 }
 
 impl<'a, T> Message<'a, T> {
-    const fn new(payload: T) -> Self {
+    pub const fn new(payload: T) -> Self {
         Self { 
             parent: OnceCell::new(), 
             linkage: Node::new(), 
@@ -142,7 +162,7 @@ impl<'a, T> Linkable for Message<'a, T> {
     }
 }
 
-struct Envelope<'a, T> {
+pub struct Envelope<'a, T> where 'a: 'static {
     inner: Ref<'a, Message<'a, T>>
 }
 
@@ -173,30 +193,31 @@ impl<'a, T> Drop for Envelope<'a, T> {
     fn drop(&mut self) {
         if let Some(msg) = self.inner.0.take() {
             let parent = msg.parent.get().unwrap();
-             parent.msgs.enqueue(Ref::new(msg));
+            parent.put_internal(Ref::new(msg));
         }
     }
 }
 
-struct Queue<'a, T: Sized> {
+pub struct Queue<'a, T: Sized> {
     msgs: List<'a, Message<'a, T>>,
     subscribers: List<'a, Actor>
 }
 
 impl<'a: 'static, T: Sized> Queue<'a, T> {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self { 
             msgs: List::new(), 
             subscribers: List::new(),
         }         
     }
     
-    fn init(&self) {
+    pub fn init(&self) {
         self.msgs.init();
         self.subscribers.init();
     }
         
     fn get(&self, actor: Ref<'a, Actor>) -> Option<Envelope<'a, T>> {
+        let _lock = LockedRegion::new();
         if self.msgs.is_empty() {
             self.subscribers.enqueue(actor);
             None
@@ -205,39 +226,43 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
         }
     }
     
-    fn put(&self, msg: Envelope<'a, T>) {
+    fn put_internal(&self, wrapper: Ref<'a, Message<'a, T>>) {
+        let _lock = LockedRegion::new();
         if self.subscribers.is_empty() {
-            self.msgs.enqueue(msg.into_wrapper());
+            self.msgs.enqueue(wrapper);
         } else {
             let actor = self.subscribers.dequeue().unwrap();
-            Actor::set(actor, msg);
-        }
+            Actor::set(actor, wrapper);
+        }        
+    }
+    
+    pub fn put(&self, msg: Envelope<'a, T>) {
+        self.put_internal(msg.into_wrapper())
     }
 }
 
-struct Pool<'a, T: Sized, const N: usize> {
+pub struct Pool<'a, T: Sized, const N: usize> {
     pool: Queue<'a, T>,
     used: Cell<usize>,
     slice: Cell<Option<&'a mut [Message<'a, T>]>>
 }
 
-macro_rules! pool_init {
-    () => { 
-        Pool { 
+impl<'a: 'static, T: Sized, const N: usize> Pool<'a, T, N> {
+    pub const fn new() -> Self {
+        Self {
             pool: Queue::new(), 
             used: Cell::new(0), 
-            slice: Cell::new(None) 
-        } 
-    };
-}
-
-impl<'a: 'static, T: Sized, const N: usize> Pool<'a, T, N> {
-    fn init(&self, arr: &'a mut [Message<'a, T>; N]) {
+            slice: Cell::new(None)             
+        }
+    }
+    
+    pub fn init(&self, arr: &'a mut [Message<'a, T>; N]) {
         self.pool.init();
         self.slice.set(Some(&mut arr[0..N]));
     }
     
-    fn alloc(&'a self) -> Option<Envelope<'a, T>> {
+    pub fn alloc(&'a self) -> Option<Envelope<'a, T>> {
+        let _lock = LockedRegion::new();
         let used = self.used.get();
         let msg = if used < N {
             let remaining_items = self.slice.take().unwrap();
@@ -254,29 +279,14 @@ impl<'a: 'static, T: Sized, const N: usize> Pool<'a, T, N> {
     }
 }
 
-type PinnedFuture = Pin<&'static mut dyn Future<Output = ()>>;
+pub type PinnedFuture = Pin<&'static mut dyn Future<Output = ()>>;
 
-#[repr(C)]
-struct Actor {
-    waker: RawWaker,
+pub struct Actor {
     prio: usize,
     future_id: Option<usize>,
     mailbox: Option<&'static mut dyn Any>,
     context: Option<&'static Executor<'static>>,
     linkage: Node<Self>
-}
-
-macro_rules! actor_new {
-    ($n:expr) => { 
-        Actor {
-            waker: noop_raw_waker(),
-            prio: $n, 
-            future_id: None,
-            mailbox: None, 
-            context: None,
-            linkage: Node::new() 
-        }
-    };
 }
 
 impl Linkable for Actor {
@@ -285,40 +295,50 @@ impl Linkable for Actor {
     }
 }
 
-const fn noop_raw_waker() -> RawWaker {
-    RawWaker::new(null(), &NOOP_WAKER_VTABLE)
+const fn noop_raw_waker(ptr: *mut Actor) -> RawWaker {
+    RawWaker::new(ptr as *const (), &NOOP_WAKER_VTABLE)
 }
 
 const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |_| noop_raw_waker(), |_| {}, |_| {}, |_| {}
+    |p| noop_raw_waker(p as *mut Actor), |_| {}, |_| {}, |_| {}
 );
 
-fn waker_ref(waker: &mut RawWaker) -> &Waker {
-    unsafe { &*(waker as *const RawWaker as *const Waker) }
-}
-
-impl Actor {   
+impl Actor {
+    pub const fn new(p: usize) -> Self {
+        Self {
+            prio: p, 
+            future_id: None,
+            mailbox: None, 
+            context: None,
+            linkage: Node::new() 
+        }    
+    }
+     
     fn call(&mut self, f: &mut OnceCell<PinnedFuture>) {
-        let waker = waker_ref(&mut self.waker);
-        let mut cx = core::task::Context::from_waker(waker);
+        let ptr: *mut Actor = self;
+        let raw_waker = noop_raw_waker(ptr);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = core::task::Context::from_waker(&waker);
         let future = f.get_mut().unwrap();
         let _ = future.as_mut().poll(&mut cx);
     }
     
-    fn set<'a: 'static, T>(wrapper: Ref<'a, Actor>, msg: Envelope<'a, T>) {
-        let actor = wrapper.release();
+    fn set<'a: 'static, T>(this: Ref<'a, Actor>, msg: Ref<'a, Message<'a, T>>) {
+        let actor = this.release();
         let exec = actor.context.take().unwrap();
-        actor.mailbox = Some(msg.into_wrapper().release());
+        actor.mailbox = Some(msg.release());
         exec.activate(actor.prio, Ref::new(actor));
-    }    
+    }
 }
 
 impl<'q: 'static, T> Future for &Queue<'q, T> {
     type Output = Envelope<'q, T>;
     
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let waker = cx.waker() as *const Waker as *mut Waker;
-        let actor = unsafe { &mut *(waker as *mut Actor) };
+        let waker = cx.waker();
+        let raw = waker.as_raw();
+        let actor_ptr = raw.data() as *mut Actor;
+        let actor = unsafe { &mut *actor_ptr };
         if let Some(any_ref) = actor.mailbox.take() {
             let msg = any_ref.downcast_mut::<Message<'q, T>>().map(
                 |msg| Ref::new(msg)
@@ -355,37 +375,41 @@ impl<'a, T> ArrayAccessor<'a, T> {
     }
 }
 
-const NPRIO: usize = 1;
-const EMPTY_CELL: OnceCell<PinnedFuture> = OnceCell::new();
+pub const NPRIO: usize = 1;
+pub const EMPTY_CELL: OnceCell<PinnedFuture> = OnceCell::new();
 
-struct Executor<'a> {
+const RUNQ_PROTO: List::<Actor> = List::<Actor>::new();
+
+pub struct Executor<'a> {
     runq: [List<'a, Actor>; NPRIO],
     futures: OnceCell<ArrayAccessor<'a, OnceCell<PinnedFuture>>>,
     ticket: AtomicUsize
 }
 
-macro_rules! executor_new {
-    () => {
-        Executor { 
-            runq: [ List::<Actor>::new(); NPRIO ], 
+impl<'a: 'static> Executor<'a> {
+    pub const fn new() -> Self {
+        Self { 
+            runq: [ RUNQ_PROTO; NPRIO ], 
             futures: OnceCell::new(), 
             ticket: AtomicUsize::new(0) 
         } 
     }
-}
-
-impl<'a: 'static> Executor<'a> {
-    fn init(&self, arr: &'a mut [OnceCell<PinnedFuture>]) {
+    
+    pub fn init(&self, arr: &'a mut [OnceCell<PinnedFuture>]) {
         let _ = self.futures.set(ArrayAccessor::new(arr));
         for i in 0..NPRIO {
             self.runq[i].init()
         }
     }
-
-    fn schedule(&'a self, vect: usize) {       
+    
+    fn extract(&self, vect: usize) -> Option<Ref<'a, Actor>> {
+        let _lock = LockedRegion::new();
         let runq = &self.runq[vect];
-        while runq.is_empty() == false {
-            let wrapper = runq.dequeue().unwrap();
+        runq.dequeue()
+    }
+
+    pub fn schedule(&'a self, vect: usize) {       
+        while let Some(wrapper) = self.extract(vect) {
             let actor = wrapper.release();
             let fut_id = actor.future_id.as_ref().copied().unwrap();
             let futures = self.futures.get().unwrap();
@@ -396,10 +420,11 @@ impl<'a: 'static> Executor<'a> {
     }
     
     fn activate(&'a self, prio: usize, wrapper: Ref<'a, Actor>) {
+        let _lock = LockedRegion::new();
         self.runq[prio].enqueue(wrapper);
     }
     
-    fn spawn(&'a self, actor: &mut Actor, f: &mut (impl Future<Output=()> + 'static)) {
+    pub fn spawn(&'a self, actor: &mut Actor, f: &mut (impl Future<Output=()> + 'static)) {
         fn to_static<'x, T>(v: &'x mut T) -> &'static mut T {
             unsafe { mem::transmute(v) }
         }        
@@ -416,7 +441,13 @@ impl<'a: 'static> Executor<'a> {
     }    
 }
 
+unsafe impl<'a> Sync for Executor<'a> {}
+unsafe impl<'a, T> Sync for Queue<'a, T> where T: Send {}
+unsafe impl<'a, T, const N: usize> Sync for Pool<'a, T, N> where T: Send {}
+
 //----------------------------------------------------------------------
+
+fn interrupt_control(_: usize) -> usize { 0 }
 
 struct ExampleMsg {
     n: u32
@@ -428,38 +459,38 @@ struct ExampleMsg2 {
 
 async fn func<'a: 'static>(
     q1: &'a Queue<'a, ExampleMsg>, 
-    q2: &'a Queue<'a, ExampleMsg2>) {
-
-    let mut sum = 0;
+    q2: &'a Queue<'a, ExampleMsg2>,
+    sum: &mut u32) {
         
     loop {
         println!("before 1st await {}", sum);
         
         let msg1 = &q1.await;
-        sum += msg1.n;
+        *sum += msg1.n;
         
         println!("before 2nd await {}", sum);
         
         let msg2 = &q2.await;
-        sum += msg2.t;
+        *sum += msg2.t;
     }
 }
 
 fn main() {
-    static mut POOL1: Pool<ExampleMsg, 2> = pool_init!();
-    static mut POOL2: Pool<ExampleMsg2, 2> = pool_init!();
-    static mut QUEUE1: Queue<ExampleMsg> = Queue::new();
-    static mut QUEUE2: Queue<ExampleMsg2> = Queue::new();
+    static POOL1: Pool<ExampleMsg, 2> = Pool::new();
+    static POOL2: Pool<ExampleMsg2, 2> = Pool::new();
+    static QUEUE1: Queue<ExampleMsg> = Queue::new();
+    static QUEUE2: Queue<ExampleMsg2> = Queue::new();
     
     const PROTO1: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
     const PROTO2: Message<ExampleMsg2> = Message::new(ExampleMsg2 { t: 0 });
-           
     static mut ARR1: [Message<ExampleMsg>; 2] = [PROTO1; 2];
     static mut ARR2: [Message<ExampleMsg2>; 2] = [PROTO2; 2];
     
     static mut FUTURES: [OnceCell<PinnedFuture>; 5] = [EMPTY_CELL; 5];
-    static mut ACTOR1: Actor = actor_new!(0);
-    static mut SCHED: Executor = executor_new!();
+    static SCHED: Executor = Executor::new();
+    
+    static mut ACTOR1: Actor = Actor::new(0);
+    static mut SUM: u32 = 0;
     
     unsafe { 
         SCHED.init(FUTURES.as_mut_slice());
@@ -468,21 +499,24 @@ fn main() {
         POOL1.init(&mut ARR1);
         POOL2.init(&mut ARR2);
     
-        let mut f = func(&QUEUE1, &QUEUE2);
+        let mut f = func(&QUEUE1, &QUEUE2, &mut SUM);
         SCHED.spawn(&mut ACTOR1, &mut f);
         
         for _ in 0..10 {
             let mut msg = POOL1.alloc().unwrap();
-            msg.n = 10;
+            msg.n = 1;
             QUEUE1.put(msg);
             
             SCHED.schedule(0);
             
             let mut msg = POOL2.alloc().unwrap();
-            msg.t = 100;
+            msg.t = 10;
             QUEUE2.put(msg);
             
             SCHED.schedule(0);
         }
+    
+        assert_eq!(SUM, 110);
     }
 }
+
