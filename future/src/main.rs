@@ -1,6 +1,8 @@
 #![feature(const_mut_refs)]
 #![feature(waker_getters)]
+#![feature(slice_take)]
 
+use core::convert::Infallible;
 use core::mem;
 use core::future::Future;
 use core::pin::Pin;
@@ -18,14 +20,14 @@ struct LockedRegion {
 impl LockedRegion {
     fn new() -> Self {
         Self {
-            old_mask: unsafe { interrupt_control(0) }
+            old_mask: interrupt_control(0)
         }
     }
 }
 
 impl Drop for LockedRegion {
     fn drop(&mut self) {
-        unsafe { interrupt_control(self.old_mask) };
+        interrupt_control(self.old_mask);
     }
 }
 
@@ -217,7 +219,7 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
     }
         
     fn get(&self, actor: Ref<'a, Actor>) -> Option<Envelope<'a, T>> {
-        let _lock = LockedRegion::new();
+        let _ = LockedRegion::new();
         if self.msgs.is_empty() {
             self.subscribers.enqueue(actor);
             None
@@ -227,7 +229,7 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
     }
     
     fn put_internal(&self, wrapper: Ref<'a, Message<'a, T>>) {
-        let _lock = LockedRegion::new();
+        let _ = LockedRegion::new();
         if self.subscribers.is_empty() {
             self.msgs.enqueue(wrapper);
         } else {
@@ -262,7 +264,7 @@ impl<'a: 'static, T: Sized, const N: usize> Pool<'a, T, N> {
     }
     
     pub fn alloc(&'a self) -> Option<Envelope<'a, T>> {
-        let _lock = LockedRegion::new();
+        let _ = LockedRegion::new();
         let used = self.used.get();
         let msg = if used < N {
             let remaining_items = self.slice.take().unwrap();
@@ -279,11 +281,12 @@ impl<'a: 'static, T: Sized, const N: usize> Pool<'a, T, N> {
     }
 }
 
-pub type PinnedFuture = Pin<&'static mut dyn Future<Output = ()>>;
+pub type ActorFuture = dyn Future<Output=Infallible> + 'static;
+pub type PinnedFuture = Pin<&'static mut ActorFuture>;
 
 pub struct Actor {
     prio: usize,
-    future_id: Option<usize>,
+    future_id: OnceCell<usize>,
     mailbox: Option<&'static mut dyn Any>,
     context: Option<&'static Executor<'static>>,
     linkage: Node<Self>
@@ -307,7 +310,7 @@ impl Actor {
     pub const fn new(p: usize) -> Self {
         Self {
             prio: p, 
-            future_id: None,
+            future_id: OnceCell::new(),
             mailbox: None, 
             context: None,
             linkage: Node::new() 
@@ -376,9 +379,6 @@ impl<'a, T> ArrayAccessor<'a, T> {
 }
 
 pub const NPRIO: usize = 1;
-pub const EMPTY_CELL: OnceCell<PinnedFuture> = OnceCell::new();
-
-const RUNQ_PROTO: List::<Actor> = List::<Actor>::new();
 
 pub struct Executor<'a> {
     runq: [List<'a, Actor>; NPRIO],
@@ -388,6 +388,7 @@ pub struct Executor<'a> {
 
 impl<'a: 'static> Executor<'a> {
     pub const fn new() -> Self {
+        const RUNQ_PROTO: List::<Actor> = List::<Actor>::new();
         Self { 
             runq: [ RUNQ_PROTO; NPRIO ], 
             futures: OnceCell::new(), 
@@ -403,7 +404,7 @@ impl<'a: 'static> Executor<'a> {
     }
     
     fn extract(&self, vect: usize) -> Option<Ref<'a, Actor>> {
-        let _lock = LockedRegion::new();
+        let _ = LockedRegion::new();
         let runq = &self.runq[vect];
         runq.dequeue()
     }
@@ -411,35 +412,47 @@ impl<'a: 'static> Executor<'a> {
     pub fn schedule(&'a self, vect: usize) {       
         while let Some(wrapper) = self.extract(vect) {
             let actor = wrapper.release();
-            let fut_id = actor.future_id.as_ref().copied().unwrap();
+            let fut_id = actor.future_id.get().unwrap();
             let futures = self.futures.get().unwrap();
-            let f = unsafe { futures.as_mut_item(fut_id) };
+            let f = unsafe { futures.as_mut_item(*fut_id) };
             actor.context = Some(self);
             actor.call(f);
         }
     }
     
     fn activate(&'a self, prio: usize, wrapper: Ref<'a, Actor>) {
-        let _lock = LockedRegion::new();
+        let _ = LockedRegion::new();
         self.runq[prio].enqueue(wrapper);
     }
     
-    pub fn spawn(&'a self, actor: &mut Actor, f: &mut (impl Future<Output=()> + 'static)) {
-        fn to_static<'x, T>(v: &'x mut T) -> &'static mut T {
-            unsafe { mem::transmute(v) }
-        }        
-        
-        let static_fut = to_static(f);
+    fn to_static<T: ?Sized>(v: &mut T) -> &'static mut T {
+        unsafe { mem::transmute(v) }
+    }  
+            
+    pub fn spawn(&'a self, actor: &mut Actor, f: &mut ActorFuture) {
+        let static_fut = Self::to_static(f);
         let pinned_fut = unsafe { Pin::new_unchecked(static_fut) };
         let fut_id = self.ticket.fetch_add(1, Ordering::SeqCst);
         let futures = self.futures.get().unwrap();
         let f = unsafe { futures.as_mut_item(fut_id) };
         let _ = f.set(pinned_fut);
-        actor.future_id = Some(fut_id);
+        actor.future_id.set(fut_id).ok().unwrap();
         actor.context = Some(self);
         actor.call(f);
-    }    
+    }
+    
+    pub fn run<const N: usize>(&'a self, mut s: [(&mut Actor, &mut ActorFuture); N]) {
+        let mut p = s.as_mut_slice();
+        
+        while let Some(pair) = p.take_first_mut() {
+            let actor: &mut Actor = pair.0;
+            let st: &mut ActorFuture = pair.1;
+            self.spawn(actor, st);
+        }
+    }
 }
+
+pub const EMPTY_CELL: OnceCell<PinnedFuture> = OnceCell::new();
 
 unsafe impl<'a> Sync for Executor<'a> {}
 unsafe impl<'a, T> Sync for Queue<'a, T> where T: Send {}
@@ -453,70 +466,66 @@ struct ExampleMsg {
     n: u32
 }
 
-struct ExampleMsg2 {
-    t: u32
+async fn proxy<'a: 'static>(
+    q1: &'a Queue<'a, ExampleMsg>,
+    q2: &'a Queue<'a, ExampleMsg>, 
+    ) -> Infallible {
+
+    loop {
+        println!("proxy");
+        
+        let msg = q1.await;
+        q2.put(msg);
+    }
 }
 
-async fn func<'a: 'static>(
-    q1: &'a Queue<'a, ExampleMsg>, 
-    q2: &'a Queue<'a, ExampleMsg2>,
-    sum: &mut u32) {
-        
+async fn adder<'a: 'static>(
+    q: &'a Queue<'a, ExampleMsg>, 
+    sum: &mut u32) -> Infallible {
+
     loop {
-        println!("before 1st await {}", sum);
-        
-        let msg1 = &q1.await;
-        *sum += msg1.n;
-        
-        println!("before 2nd await {}", sum);
-        
-        let msg2 = &q2.await;
-        *sum += msg2.t;
+        println!("adder {}", *sum);
+        let msg = q.await;
+        *sum += msg.n;
     }
 }
 
 fn main() {
-    static POOL1: Pool<ExampleMsg, 2> = Pool::new();
-    static POOL2: Pool<ExampleMsg2, 2> = Pool::new();
+    static POOL1: Pool<ExampleMsg, 5> = Pool::new();
     static QUEUE1: Queue<ExampleMsg> = Queue::new();
-    static QUEUE2: Queue<ExampleMsg2> = Queue::new();
+    static QUEUE2: Queue<ExampleMsg> = Queue::new();
     
     const PROTO1: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
-    const PROTO2: Message<ExampleMsg2> = Message::new(ExampleMsg2 { t: 0 });
-    static mut ARR1: [Message<ExampleMsg>; 2] = [PROTO1; 2];
-    static mut ARR2: [Message<ExampleMsg2>; 2] = [PROTO2; 2];
+    static mut ARR1: [Message<ExampleMsg>; 5] = [PROTO1; 5];
     
     static mut FUTURES: [OnceCell<PinnedFuture>; 5] = [EMPTY_CELL; 5];
     static SCHED: Executor = Executor::new();
     
     static mut ACTOR1: Actor = Actor::new(0);
+    static mut ACTOR2: Actor = Actor::new(0);
     static mut SUM: u32 = 0;
+
+    QUEUE1.init();
+    QUEUE2.init();
     
-    unsafe { 
-        SCHED.init(FUTURES.as_mut_slice());
-        QUEUE1.init();
-        QUEUE2.init();
+    unsafe {         
         POOL1.init(&mut ARR1);
-        POOL2.init(&mut ARR2);
     
-        let mut f = func(&QUEUE1, &QUEUE2, &mut SUM);
-        SCHED.spawn(&mut ACTOR1, &mut f);
+        let mut f1 = proxy(&QUEUE1, &QUEUE2);
+        let mut f2 = adder(&QUEUE2, &mut SUM);
+        
+        SCHED.init(FUTURES.as_mut_slice());
+        SCHED.run([
+            (&mut ACTOR1, &mut f1),
+            (&mut ACTOR2, &mut f2)
+        ]);
         
         for _ in 0..10 {
             let mut msg = POOL1.alloc().unwrap();
             msg.n = 1;
             QUEUE1.put(msg);
             
-            SCHED.schedule(0);
-            
-            let mut msg = POOL2.alloc().unwrap();
-            msg.t = 10;
-            QUEUE2.put(msg);
-            
-            SCHED.schedule(0);
+            SCHED.schedule(0);            
         }
-    
-        assert_eq!(SUM, 110);
     }
 }
-
