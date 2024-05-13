@@ -53,7 +53,7 @@ impl<'a, T> Ref<'a, T> {
 
 struct Node<T> {
     links: Cell<Option<(*const Node<T>, *const Node<T>)>>,
-    payload: Cell<Option<*mut T>>,
+    payload: Cell<Option<*const T>>,
 }
 
 impl<T> Node<T> {
@@ -76,16 +76,33 @@ impl<T> Node<T> {
         }
     }
 
-    fn unlink<'a>(&self) -> Option<Ref<'a, T>> {
+    fn unlink<'a>(&self) -> Option<*const T> {
         self.links.take().map(|(prev, next)| {
             let ptr = self.payload.take().unwrap();
             unsafe {
                 (*prev).set_next(next);
                 (*next).set_prev(prev);
-                Ref::new(&mut *ptr)
+                ptr
             }
         })
     }
+    
+    fn unlink_mut<'a>(&self) -> Option<Ref<'a, T>> {
+        self.unlink().map(|ptr| {
+            let p = ptr as *mut T;
+            unsafe {
+                Ref::new(&mut *p)
+            }
+        })
+    }
+    
+    fn unlink_ref<'a>(&self) -> Option<&'a T> {
+        self.unlink().map(|ptr| {
+            unsafe {
+                &*ptr
+            }
+        })
+    }    
 }
 
 trait Linkable: Sized {
@@ -139,7 +156,7 @@ impl<'a, T: Linkable> List<'a, T> {
 
     fn dequeue(&self) -> Option<Ref<'a, T>> {
         self.peek_head_node().map(|node| {
-            node.unlink().unwrap()
+            node.unlink_mut().unwrap()
         })
     }
 }
